@@ -8,7 +8,11 @@ import {
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
 import { handleToolCall } from './index.js';
-import { checkPrematureInvalidation } from './layers.js';
+import { checkPrematureInvalidation, loadGraphIndex } from './layers.js';
+import {
+  type AllocationResult,
+  allocateStableIdsForBatch,
+} from './stable-ids.js';
 
 // Sentinel error class used by handleBatchTools to bubble an
 // "intentional early return with payload" out of a transactional block
@@ -600,6 +604,36 @@ export async function handleBatchTools(
     }
   }
 
+  // STABLE IDENTIFIERS: issue "H<n>" / "H<n>/<k>" from the graph as it is NOW,
+  // rather than trusting the number the writer read at some earlier point in
+  // its session. Two cycles a day apart both wrote H21 because both had read
+  // the graph while H20 was the maximum; with parallel subagents that is the
+  // expected outcome, not bad luck.
+  //
+  // Deliberately the LAST thing before the transaction — after the duplicate
+  // check, which makes network calls to the embedding provider and can take
+  // seconds. That shrinks the window in which another writer can take the same
+  // number from "however long the agent was thinking" to a few milliseconds.
+  // It does not close it: two batches committing at the same instant can still
+  // both be issued the same number, because nothing in the schema makes a
+  // title unique. Closing it properly needs a uniqueness constraint or an
+  // advisory lock, which is a storage change, not a tool change.
+  //
+  // Mutates the operations in place; only ever touches canonical layer titles
+  // ("H12 · …" on a prediction/question, "H12/3 · …" on an experiment), never
+  // a supersession, never commentary about a claim. Every change is reported
+  // back to the writer in `stableIds`.
+  let idAllocation: AllocationResult = { allocations: [], notes: [] };
+  try {
+    idAllocation = allocateStableIdsForBatch(
+      operations,
+      loadGraphIndex(contextManager.getCurrentProjectId()),
+    );
+  } catch {
+    // Allocation is a safeguard, not a gate: if the index cannot be read, the
+    // batch still commits with the titles the agent wrote.
+  }
+
   const results: unknown[] = [];
   const errors: Array<{ index: number; tool: string; error: string }> = [];
   const affectedDocRoots = new Set<string>(); // Track doc roots that need regeneration
@@ -964,6 +998,21 @@ Then connect the doc to it with an 'expresses' edge.`;
     scoreHint += `\n\n⚠️ CLAIM INVALIDATED WITH OPEN APPROACHES:\n${rendered}`;
   }
 
+  if (idAllocation.allocations.length > 0) {
+    const rendered = idAllocation.allocations
+      .map(
+        (a) =>
+          `  • op ${a.operationIndex}: ${a.proposed} → ${a.assigned} (${a.reason}) — ${a.detail}`,
+      )
+      .join('\n');
+    scoreHint += `\n\n🔢 STABLE IDENTIFIER ISSUED BY THE ENGINE:\n${rendered}\nThe node is committed under the assigned id. If your prose, spec files or run notes quote the id you proposed, update them to the assigned one.`;
+  }
+  if (idAllocation.notes.length > 0) {
+    scoreHint += `\n\n🔢 IDENTIFIER CONVENTION:\n${idAllocation.notes
+      .map((n) => `  • op ${n.operationIndex}: ${n.message}`)
+      .join('\n')}`;
+  }
+
   return {
     success: !hasErrors,
     completed: operations.length,
@@ -971,6 +1020,10 @@ Then connect the doc to it with an 'expresses' edge.`;
     results,
     errors: hasErrors ? errors : undefined,
     layerWarnings: layerWarnings.length > 0 ? layerWarnings : undefined,
+    stableIds:
+      idAllocation.allocations.length > 0 || idAllocation.notes.length > 0
+        ? idAllocation
+        : undefined,
     commit,
     regeneratedDocuments:
       regeneratedDocs.length > 0 ? regeneratedDocs : undefined,

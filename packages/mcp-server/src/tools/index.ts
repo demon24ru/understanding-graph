@@ -186,7 +186,11 @@ export async function handleToolCall(
   }
 
   // Second-layer tools: claims vs the tree of approaches under them
-  if (name === 'graph_approaches' || name === 'graph_frontier') {
+  if (
+    name === 'graph_approaches' ||
+    name === 'graph_frontier' ||
+    name === 'graph_next_id'
+  ) {
     return handleLayerTools(name, args, contextManager);
   }
 

@@ -32,6 +32,14 @@ import {
 } from '@emergent-wisdom/understanding-graph-core';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
+import {
+  findIdCollisions,
+  formatStableId,
+  nextFreeApproachNum,
+  nextFreeClaimNum,
+  parseStableId,
+  scanStableIds,
+} from './stable-ids.js';
 
 /** Edges that pass judgement on a node, in either direction. */
 export const ADJUDICATING_EDGE_TYPES = ['validates', 'invalidates'] as const;
@@ -222,18 +230,36 @@ export function claimOfApproach(
   approachId: string,
   index: GraphIndex,
   maxHops = 8,
-): { id: string; name: string; hops: number } | null {
+): {
+  id: string;
+  name: string;
+  hops: number;
+  /** Every claim this approach declares itself a way of testing, when >1. */
+  alsoImplements?: Array<{ id: string; name: string }>;
+} | null {
   let current = approachId;
   const seen = new Set<string>([approachId]);
 
   for (let hop = 0; hop < maxHops; hop++) {
     const outgoing = index.out.get(current) || [];
-    const impl = outgoing.find((e) => e.type === 'implements');
+    const impls = outgoing.filter((e) => e.type === 'implements');
+    const impl = impls[0];
     if (impl) {
+      // More than one `implements` edge is not a richer attribution, it is an
+      // unresolved one — and it happens exactly when two claims share a stable
+      // id and the writer wired its approach to both. Reporting only the first
+      // (which is what every caller used to get) hides half the topology.
       return {
         id: impl.toId,
         name: index.nodes.get(impl.toId)?.title ?? 'unknown',
         hops: hop,
+        alsoImplements:
+          impls.length > 1
+            ? impls.slice(1).map((e) => ({
+                id: e.toId,
+                name: index.nodes.get(e.toId)?.title ?? 'unknown',
+              }))
+            : undefined,
       };
     }
     const up = outgoing.find(
@@ -328,19 +354,56 @@ export function collectApproaches(
   return out;
 }
 
+/** Has something replaced this node? An incoming `supersedes` edge says yes. */
+export function isSuperseded(nodeId: string, index: GraphIndex): boolean {
+  return (index.in.get(nodeId) || []).some((e) => e.type === 'supersedes');
+}
+
+export interface ResolveFailure {
+  error: string;
+  candidates: string[];
+  /** True when the reference matched several nodes rather than none. */
+  ambiguous: boolean;
+}
+
 /**
  * Resolve a claim reference: an exact node id, or the stable id that leads the
  * title ("H10" matches "H10 · …"). Title matching is what the convention
  * actually relies on, so it has to work here.
+ *
+ * Resolution is TIERED, and the tiers matter — without them a graph that
+ * contains "H16 · …" (the claim), "H16/1 · …" (an approach mistyped as a
+ * prediction) and "H16 REFUTED …" (commentary) makes "H16" unresolvable even
+ * though exactly one node is canonically named H16:
+ *
+ *   1. exact node id;
+ *   2. CANONICAL form — the title is "<ref> · …", the shape the convention
+ *      prescribes. This is what an agent means by "H16";
+ *   3. token prefix — "<ref>" followed by anything that is not another
+ *      identifier character ("H20-Б · …", "H15 is UNTESTED …").
+ *
+ * The first tier that matches anything wins; deeper tiers are never consulted,
+ * so a well-formed title always beats a loosely-related one. Inside a tier the
+ * layer the reference asks for is preferred (claim triggers for "H16",
+ * `experiment` for "H16/1").
+ *
+ * When a tier still holds several nodes the reference is genuinely AMBIGUOUS —
+ * two claims really do share one number — and this returns an error naming
+ * every candidate. It never picks one silently: choosing for the caller is how
+ * an approach tree gets attributed to the wrong claim.
  */
 export function resolveClaim(
   ref: string,
   index: GraphIndex,
-): { id: string; name: string } | { error: string; candidates: string[] } {
+): { id: string; name: string } | ResolveFailure {
   const direct = index.nodes.get(ref);
   if (direct) return { id: direct.id, name: direct.title };
 
   const needle = ref.trim().toLowerCase();
+  const escaped = needle.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  // "H16 · …" / "H16/1 · …" — the canonical shape, separator included.
+  const canonicalRe = new RegExp(`^\\s*${escaped}\\s*[·•]`, 'i');
+
   const startsWithId = (title: string) => {
     const t = title.trim().toLowerCase();
     if (!t.startsWith(needle)) return false;
@@ -350,32 +413,57 @@ export function resolveClaim(
     return rest === '' || !/^[a-z0-9]/.test(rest);
   };
 
-  const byPrefix = [...index.nodes.values()].filter((n) =>
+  const all = [...index.nodes.values()];
+  const canonical = all.filter((n) => canonicalRe.test(n.title));
+  const byPrefix = canonical.length > 0 ? canonical : all.filter((n) =>
     startsWithId(n.title),
   );
+  const tier = canonical.length > 0 ? 'canonical' : 'prefix';
+
+  const describe = (n: GraphIndexNode) =>
+    `${n.id} [${n.trigger ?? 'no trigger'}, created ${n.createdAt}] — ${n.title}`;
+
   if (byPrefix.length === 1) {
     return { id: byPrefix[0].id, name: byPrefix[0].title };
   }
   if (byPrefix.length > 1) {
-    // Prefer a layer-1 node when the id prefix is shared with its approaches
-    // ("H10 · …" alongside "H10/2 · …" — the latter fails startsWithId only
-    // when the separator differs, so filter explicitly).
-    const claims = byPrefix.filter(
-      (n) => n.trigger === 'prediction' || n.trigger === 'question',
+    // Prefer the layer the reference asks for: an approach reference ("H10/2")
+    // wants trigger `experiment`, a claim reference wants prediction/question.
+    const wantsApproach = needle.includes('/');
+    const preferred = byPrefix.filter((n) =>
+      wantsApproach
+        ? n.trigger === APPROACH_TRIGGER
+        : (CLAIM_TRIGGERS as readonly string[]).includes(n.trigger ?? ''),
     );
-    if (claims.length === 1) return { id: claims[0].id, name: claims[0].title };
+    if (preferred.length === 1) {
+      return { id: preferred[0].id, name: preferred[0].title };
+    }
+    let shortlist = preferred.length > 1 ? preferred : byPrefix;
+
+    // A re-specification KEEPS the identifier — that is what `supersedes`
+    // means — so an id shared between a claim and the version that replaced it
+    // is not a collision: the live head is what "H10" refers to now, and the
+    // superseded one stays reachable by node id and through history.
+    const live = shortlist.filter((n) => !isSuperseded(n.id, index));
+    if (live.length === 1) return { id: live[0].id, name: live[0].title };
+    if (live.length > 1) shortlist = live;
     return {
-      error: `"${ref}" matches ${byPrefix.length} nodes. Pass a node id.`,
-      candidates: byPrefix.slice(0, 10).map((n) => `${n.id} — ${n.title}`),
+      ambiguous: true,
+      error:
+        `AMBIGUOUS IDENTIFIER: "${ref}" names ${shortlist.length} different nodes ` +
+        `(matched on the ${tier} form of the title). This is a real collision in the ` +
+        'corpus — two nodes were written with the same stable id — not a typo in your ' +
+        'query. Pick the one you mean by node id; they are listed below with their ' +
+        'trigger and creation date.',
+      candidates: shortlist.slice(0, 10).map(describe),
     };
   }
 
-  const contains = [...index.nodes.values()].filter((n) =>
-    n.title.toLowerCase().includes(needle),
-  );
+  const contains = all.filter((n) => n.title.toLowerCase().includes(needle));
   return {
+    ambiguous: false,
     error: `No node found for "${ref}".`,
-    candidates: contains.slice(0, 10).map((n) => `${n.id} — ${n.title}`),
+    candidates: contains.slice(0, 10).map(describe),
   };
 }
 
@@ -455,6 +543,29 @@ export const layerTools: Tool[] = [
       },
     },
   },
+  {
+    name: 'graph_next_id',
+    description:
+      'ISSUE A STABLE IDENTIFIER. Returns the next free claim id ("H25"), or — with `claim` — the next free approach id under that claim ("H12/4"), read from the graph as it is right now. Use it before writing a claim or an approach instead of guessing the number from what you last read: two cycles that both guessed produced two different claims both called H21, and neither can be reached by name any more. ADVISORY ONLY: graph_batch is the authority and re-issues the number at commit time if this one was taken in the meantime, so a batch written from a stale answer is corrected rather than colliding. Also reports the identifiers that already collide.',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        claim: {
+          type: 'string',
+          description:
+            'Node id or stable id of the claim to number an approach under. Omit to get the next free CLAIM id.',
+        },
+        includeArchived: {
+          type: 'boolean',
+          description: 'Include archived nodes (default: false)',
+        },
+        project: {
+          type: 'string',
+          description: 'Project ID (optional)',
+        },
+      },
+    },
+  },
 ];
 
 export async function handleLayerTools(
@@ -476,9 +587,15 @@ export async function handleLayerTools(
         return {
           success: false,
           project: projectId,
+          ambiguous: resolved.ambiguous,
           error: resolved.error,
           candidates: resolved.candidates,
-          hint: 'Pass the node id, or the exact stable id that leads the claim title.',
+          hint: resolved.ambiguous
+            ? 'Call graph_approaches once per candidate id to see the two trees separately. ' +
+              'If they are the same claim written twice, connect one to the other with a ' +
+              '`supersedes` edge; if they are different claims, one of them needs a free ' +
+              'identifier (graph_next_id issues one). History is not rewritten either way.'
+            : 'Pass the node id, or the exact stable id that leads the claim title.',
         };
       }
 
@@ -494,6 +611,23 @@ export async function handleLayerTools(
       const tree = collectApproaches(resolved.id, index, maxDepth);
       const approaches = tree.filter((a) => a.isApproach);
       const open = approaches.filter((a) => a.status === 'open');
+
+      // Two approaches under one claim carrying the same "/k" are two
+      // different attempts that cannot be told apart by name — in the prose of
+      // a later cycle, "H17/1 failed" then means nothing definite.
+      const byStableId = new Map<string, string[]>();
+      for (const a of approaches) {
+        const parsed = parseStableId(a.name);
+        if (!parsed || parsed.claimNum === null || parsed.approachNum === null)
+          continue;
+        const key = formatStableId(parsed.claimNum, parsed.approachNum);
+        const bucket = byStableId.get(key);
+        if (bucket) bucket.push(a.id);
+        else byStableId.set(key, [a.id]);
+      }
+      const duplicateApproachIds = [...byStableId.entries()]
+        .filter(([, ids]) => ids.length > 1)
+        .map(([stableId, ids]) => ({ stableId, nodes: ids }));
 
       return {
         project: projectId,
@@ -512,6 +646,8 @@ export async function handleLayerTools(
           confirmed: approaches.filter((a) => a.status === 'confirmed').length,
           other: tree.length - approaches.length,
         },
+        duplicateApproachIds:
+          duplicateApproachIds.length > 0 ? duplicateApproachIds : undefined,
         tree,
         hint:
           tree.length === 0
@@ -553,10 +689,7 @@ export async function handleLayerTools(
       const approachNodes = allNodes.filter(
         (n) => n.trigger === APPROACH_TRIGGER,
       );
-      const claimOf = new Map<
-        string,
-        { id: string; name: string; hops: number } | null
-      >();
+      const claimOf = new Map<string, ReturnType<typeof claimOfApproach>>();
       for (const a of approachNodes) {
         claimOf.set(a.id, claimOfApproach(a.id, index));
       }
@@ -581,6 +714,27 @@ export async function handleLayerTools(
         .map((c) => ({ id: c.id, name: c.title, trigger: c.trigger }));
 
       const unattached = openApproaches.filter((a) => !claimOf.get(a.id));
+
+      // Stable-id collisions: two claims (or two approaches) written with the
+      // same identifier. They are invisible in every per-node view and they
+      // make `graph_approaches("H21")` unanswerable, so the frontier — the one
+      // call every planning stage makes — is where they have to surface.
+      const idCollisions = findIdCollisions(scanStableIds(index), index);
+
+      // Approaches that declare themselves a way of testing more than one
+      // claim. Attribution picks the first edge, so the rest are invisible
+      // everywhere else.
+      const ambiguouslyAttributed = approachNodes
+        .map((a) => {
+          const c = claimOf.get(a.id);
+          if (!c?.alsoImplements) return null;
+          return {
+            id: a.id,
+            name: a.title,
+            claims: [{ id: c.id, name: c.name }, ...c.alsoImplements],
+          };
+        })
+        .filter((x): x is NonNullable<typeof x> => x !== null);
 
       // Open approaches whose claim has ALREADY been adjudicated: the exact
       // wreckage of "a failed approach read as a failed idea". Each one is a
@@ -613,7 +767,11 @@ export async function handleLayerTools(
           ).length,
           openApproachesWithNoClaim: unattached.length,
           openApproachesUnderClosedClaims: strandedByAVerdict.length,
+          collidingIdentifiers: idCollisions.length,
+          approachesImplementingSeveralClaims: ambiguouslyAttributed.length,
         },
+        collidingIdentifiers: idCollisions,
+        approachesImplementingSeveralClaims: ambiguouslyAttributed,
         openClaims: openClaimNodes.slice(0, limit).map((c) => ({
           id: c.id,
           name: c.title,
@@ -636,7 +794,76 @@ export async function handleLayerTools(
                 strandedByAVerdict.length > 0
                   ? ` ⚠️ openApproachesUnderClosedClaims (${strandedByAVerdict.length}): live ways of testing a claim someone already declared settled — re-open the claim or close these explicitly, with a reason.`
                   : ''
+              }${
+                idCollisions.length > 0
+                  ? ` ⚠️ collidingIdentifiers (${idCollisions.length}): ${idCollisions
+                      .map((c) => c.stableId)
+                      .join(', ')} each name more than one node, so those ids cannot be resolved by name at all. New nodes now get their number from the engine; these are the pre-existing ones and they are left exactly as written.`
+                  : ''
               }`,
+      };
+    }
+
+    case 'graph_next_id': {
+      const scan = scanStableIds(index);
+      const collisions = findIdCollisions(scan, index);
+      const ref = typeof args.claim === 'string' ? args.claim.trim() : '';
+
+      if (!ref) {
+        const num = nextFreeClaimNum(scan);
+        return {
+          project: projectId,
+          isExternal,
+          nextClaimId: formatStableId(num),
+          highestInUse: scan.maxClaimNum > 0 ? `H${scan.maxClaimNum}` : null,
+          claimsInUse: scan.claims.size,
+          collidingIdentifiers: collisions,
+          hint:
+            `Title the claim "${formatStableId(num)} · <the claim, stated so it can fail>" and give it ` +
+            'trigger `prediction` (or `question`). Numbers are never re-used, so a gap is a deleted ' +
+            'claim, not a free slot. If another writer takes this number first, graph_batch will ' +
+            'issue you the next one at commit time and say so in its result.',
+        };
+      }
+
+      const resolved = resolveClaim(ref, index);
+      if ('error' in resolved) {
+        return {
+          success: false,
+          project: projectId,
+          ambiguous: resolved.ambiguous,
+          error: resolved.error,
+          candidates: resolved.candidates,
+          hint: 'Pass the node id of the claim you mean.',
+        };
+      }
+      const parsed = parseStableId(resolved.name);
+      if (!parsed || parsed.claimNum === null) {
+        return {
+          success: false,
+          project: projectId,
+          error: `"${resolved.name.slice(0, 80)}" carries no canonical stable id ("H<n> · …"), so approaches under it cannot be numbered.`,
+          hint: 'Give the claim a canonical title first (graph_revise), or attach the approach by `implements` edge alone.',
+        };
+      }
+      const k = nextFreeApproachNum(scan, parsed.claimNum);
+      const existing = [...scan.approaches.entries()]
+        .filter(([key]) => key.startsWith(`${parsed.claimNum}/`))
+        .flatMap(([key, nodes]) => nodes.map((n) => `H${key} — ${n.id}`))
+        .sort();
+      return {
+        project: projectId,
+        isExternal,
+        claim: { id: resolved.id, name: resolved.name },
+        nextApproachId: formatStableId(parsed.claimNum, k),
+        existingApproaches: existing,
+        collidingIdentifiers: collisions.filter((c) =>
+          c.stableId.startsWith(`H${parsed.claimNum}/`),
+        ),
+        hint:
+          `Title the approach "${formatStableId(parsed.claimNum, k)} · <what this attempt actually does>", ` +
+          `trigger \`experiment\`, and connect it to ${resolved.id} with an \`implements\` edge in the ` +
+          'same batch — the edge is what makes it layer 2; the number only makes it readable.',
       };
     }
 
