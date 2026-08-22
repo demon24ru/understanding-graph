@@ -1238,3 +1238,218 @@ describe('graph_rename edits the address space', () => {
     expect(revs.currentVersion).toBe(1);
   });
 });
+
+// ---------------------------------------------------------------------------
+// The same address space, reached by the other door. `graph_bulk_replace` is
+// find/replace over text columns, and `title` is one of them — so a run of
+// "H81" → "H80" edits identifiers a hundred nodes at a time without ever
+// passing the rename guard. These tests pin that it now answers to the same
+// rule: report every move, refuse the ones that take a live address.
+// ---------------------------------------------------------------------------
+
+describe('graph_bulk_replace edits the address space too', () => {
+  it('REFUSES a run whose rewritten title takes an identifier a live claim wears', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    const res = await call('graph_bulk_replace', {
+      find: 'H81',
+      replace: 'H80',
+      preview: false,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.error).toBe('IDENTIFIER_IN_USE');
+    const captures = res.identifierCaptures as Array<{
+      nodeId: string;
+      stableId: string;
+      layer: string;
+      attemptedTitle: string;
+      ownedBy: Array<{ id: string }>;
+    }>;
+    expect(captures).toHaveLength(1);
+    expect(captures[0].nodeId).toBe(ids.h81);
+    expect(captures[0].stableId).toBe('H80');
+    expect(captures[0].layer).toBe('claim');
+    expect(captures[0].attemptedTitle).toBe(
+      'H80 · the second, unrelated claim',
+    );
+    expect(captures[0].ownedBy.map((n) => n.id)).toEqual([ids.h80]);
+
+    // The refusal names the holder and both ways forward, exactly as the
+    // rename refusal does — it is the same sentence, from the same helper.
+    const message = String(res.message);
+    expect(message).toContain(ids.h80);
+    expect(message).toContain('H80 · the first claim');
+    expect(message).toContain('supersedes');
+    expect(message).toContain('graph_next_id');
+    expect(String(res.hint)).toContain('graph_rename');
+
+    // Nothing was written — not the title that would have captured, and not
+    // the rest of the run either.
+    const frontier = await call('graph_frontier', {});
+    const open = frontier.openClaims as Array<{ id: string; name: string }>;
+    expect(open.find((c) => c.id === ids.h81)?.name).toBe(
+      'H81 · the second, unrelated claim',
+    );
+    expect(
+      (frontier.counts as Record<string, number>).collidingIdentifiers,
+    ).toBe(0);
+    const resolved = await call('graph_approaches', { claim: 'H80' });
+    expect((resolved.claim as { id: string }).id).toBe(ids.h80);
+  });
+
+  it('says in PREVIEW that the run would be refused, instead of promising the change', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    // preview defaults to true: the dry run still has to tell the truth about
+    // what applying it would do.
+    const res = await call('graph_bulk_replace', {
+      find: 'H81',
+      replace: 'H80',
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.preview).toBe(true);
+    expect(res.matchCount).toBe(1);
+    expect(String(res.message)).toContain('REFUSED');
+    expect(String(res.addressWarning)).toContain('WOULD BE REFUSED');
+    expect(
+      (
+        res.identifierCaptures as Array<{ ownedBy: Array<{ id: string }> }>
+      )[0].ownedBy.map((n) => n.id),
+    ).toEqual([ids.h80]);
+    expect(String(res.hint)).toContain('graph_rename');
+
+    const frontier = await call('graph_frontier', {});
+    const open = frontier.openClaims as Array<{ id: string; name: string }>;
+    expect(open.find((c) => c.id === ids.h81)?.name).toBe(
+      'H81 · the second, unrelated claim',
+    );
+  });
+
+  it('REFUSES a run that would land two nodes on one identifier neither of them wore', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    // H90 is free, so neither rewrite CAPTURES anything — the damage is that
+    // they arrive at the same free address together, which the per-node check
+    // cannot see and the frontier would only report afterwards.
+    const res = await call('graph_bulk_replace', {
+      replacements: [
+        { find: 'H80 ·', replace: 'H90 ·' },
+        { find: 'H81 ·', replace: 'H90 ·' },
+      ],
+      preview: false,
+    });
+
+    expect(res.success).toBe(false);
+    expect(res.error).toBe('IDENTIFIER_IN_USE');
+    expect(res.identifierCaptures).toBeUndefined();
+    const colliding = res.collidingIdentifiers as Array<{
+      stableId: string;
+      layer: string;
+      nodes: Array<{ id: string }>;
+    }>;
+    expect(colliding).toHaveLength(1);
+    expect(colliding[0].stableId).toBe('H90');
+    expect(colliding[0].layer).toBe('claim');
+    expect(colliding[0].nodes.map((n) => n.id).sort()).toEqual(
+      [ids.h80, ids.h81].sort(),
+    );
+    expect(String(res.message)).toContain('ambiguous');
+
+    const frontier = await call('graph_frontier', {});
+    const names = (frontier.openClaims as Array<{ name: string }>).map(
+      (c) => c.name,
+    );
+    expect(names).toContain('H80 · the first claim');
+    expect(names).toContain('H81 · the second, unrelated claim');
+  });
+
+  it('lets a move onto a FREE identifier through, and reports it', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    const res = await call('graph_bulk_replace', {
+      find: 'H81',
+      replace: 'H83',
+      preview: false,
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.preview).toBe(false);
+    expect(res.addressChanges).toEqual([
+      {
+        nodeId: ids.h81,
+        before: 'H81 · the second, unrelated claim',
+        after: 'H83 · the second, unrelated claim',
+        stableIdBefore: 'H81',
+        stableIdAfter: 'H83',
+        change: 'reassigned',
+      },
+    ]);
+    // Moving an address is reported, never refused — the same split
+    // graph_rename draws between "ADDRESS MOVED" and IDENTIFIER_IN_USE.
+    expect(String(res.addressWarning)).toContain('ADDRESS SPACE');
+    expect(String(res.addressWarning)).toContain('H81 → H83');
+
+    const resolved = await call('graph_approaches', { claim: 'H83' });
+    expect((resolved.claim as { id: string }).id).toBe(ids.h81);
+    const lost = await call('graph_approaches', { claim: 'H81' });
+    expect(lost.success).toBe(false);
+  });
+
+  it('says so when a replacement strips the identifier off a title', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    const res = await call('graph_bulk_replace', {
+      find: 'H80 · ',
+      replace: '',
+      preview: false,
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.addressChanges).toMatchObject([
+      {
+        nodeId: ids.h80,
+        after: 'the first claim',
+        stableIdBefore: 'H80',
+        stableIdAfter: null,
+        change: 'dropped',
+      },
+    ]);
+    expect(String(res.addressWarning)).toContain('H80 → (none)');
+
+    // Still an open claim; only unreachable by the name earlier cycles used.
+    const frontier = await call('graph_frontier', {});
+    expect(
+      (frontier.openClaims as Array<{ id: string }>).map((c) => c.id),
+    ).toContain(ids.h80);
+    const lost = await call('graph_approaches', { claim: 'H80' });
+    expect(lost.success).toBe(false);
+  });
+
+  it('says nothing about addresses when the run does not touch titles', async () => {
+    const ids = await seedTwoCanonicalClaims();
+
+    const res = await call('graph_bulk_replace', {
+      find: 'holds',
+      replace: 'stands',
+      fields: ['understanding'],
+      preview: false,
+    });
+
+    expect(res.success).toBe(true);
+    expect(res.matchCount).toBe(2);
+    expect(res.addressChanges).toBeUndefined();
+    expect(res.addressWarning).toBeUndefined();
+    expect(res.identifierCaptures).toBeUndefined();
+
+    // The prose moved, the address space did not.
+    const frontier = await call('graph_frontier', {});
+    const open = frontier.openClaims as Array<{ id: string; name: string }>;
+    expect(open.find((c) => c.id === ids.h80)?.name).toBe(
+      'H80 · the first claim',
+    );
+    const context = (await call('graph_context', { node: ids.h81 })) as Res;
+    expect(JSON.stringify(context)).toContain('B stands.');
+  });
+});

@@ -1555,6 +1555,25 @@ export interface BulkReplaceOptions {
   preview?: boolean;
 }
 
+/**
+ * A title this replacement would rewrite, whole: the value before and the
+ * value after every replacement in the set has chained through it.
+ *
+ * `changes` cannot answer that question — it is one row per (node, field,
+ * replacement) with a COUNT, so a caller reading it sees that a title was
+ * touched three times but never what it ends up saying. A title is not just
+ * another text field in this corpus: where it carries a stable identifier
+ * ("H34 · ..."), the title IS the address other agents resolve the node by, so
+ * the caller has to be able to judge the finished string before it lands.
+ * Policy stays out of here — this layer reports the rewrite, the MCP layer
+ * decides whether the address space may take it.
+ */
+export interface BulkReplaceTitleChange {
+  nodeId: string;
+  before: string;
+  after: string;
+}
+
 export interface BulkReplaceResult {
   preview: boolean;
   matchCount: number;
@@ -1567,6 +1586,8 @@ export interface BulkReplaceResult {
     occurrences: number;
   }>;
   summary: Array<{ find: string; replace: string; matches: number }>;
+  /** Final before/after for every node whose TITLE this run rewrites. */
+  titleChanges: BulkReplaceTitleChange[];
 }
 
 export function bulkReplace(options: BulkReplaceOptions): BulkReplaceResult {
@@ -1672,6 +1693,20 @@ export function bulkReplace(options: BulkReplaceOptions): BulkReplaceResult {
     });
   }
 
+  // Every title this run rewrites, as the finished string. Read from the
+  // chained `currentValues` rather than from `changes`, so a title touched by
+  // several replacements is reported once, with the value it ends up carrying.
+  const titleChanges: BulkReplaceTitleChange[] = [];
+  for (const node of nodes) {
+    const current = currentValues.get(node.id);
+    if (!current) continue;
+    const before = node.title ?? '';
+    const after = current.title ?? '';
+    if (before !== after) {
+      titleChanges.push({ nodeId: node.id, before, after });
+    }
+  }
+
   // Apply changes if not preview
   if (!preview && changes.length > 0) {
     const updateStmt = database.prepare(`
@@ -1722,6 +1757,7 @@ export function bulkReplace(options: BulkReplaceOptions): BulkReplaceResult {
     replacementCount: replacements.length,
     changes,
     summary,
+    titleChanges,
   };
 }
 

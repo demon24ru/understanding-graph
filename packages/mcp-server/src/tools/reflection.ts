@@ -11,7 +11,19 @@ import {
 } from '@emergent-wisdom/understanding-graph-core';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
-import { deriveStatus, loadGraphIndex } from './layers.js';
+import {
+  deriveStatus,
+  type GraphIndex,
+  loadGraphIndex,
+  looseStableId,
+} from './layers.js';
+import {
+  type AddressCapture,
+  describeAddressCapture,
+  findAddressCapture,
+  formatStableId,
+  parseStableId,
+} from './stable-ids.js';
 
 /**
  * Helper to check if we should read from another project.
@@ -718,7 +730,8 @@ export const reflectionTools: Tool[] = [
   {
     name: 'graph_bulk_replace',
     description:
-      'Find and replace text across all nodes in the graph. Useful for renaming characters, locations, or concepts. Supports single replacement or batch replacements. Use preview mode first to see what will change.',
+      'Find and replace text across all nodes in the graph. Useful for renaming characters, locations, or concepts. Supports single replacement or batch replacements. Use preview mode first to see what will change. ' +
+      'TITLES ARE THE ADDRESS SPACE: `fields` includes `title` by default, and where a title carries a stable identifier ("H34 · …") that identifier is how every other agent reaches the node. A replacement that rewrites one is reported as `addressChanges`, in the same shape graph_rename returns — and REFUSED (error IDENTIFIER_IN_USE) when the rewritten title would take an identifier a live node still wears, or would land two nodes on one identifier. The refusal is whole-run: nothing is written, because a half-applied renumbering (the approaches moved, the claim above them left behind) is worse than none. Moving an address on purpose is the job of graph_rename — in one graph_batch with the `supersedes` edge when the address is handed on, or onto a free number from graph_next_id. To rewrite prose without touching the address space, pass fields: ["understanding", "content", "summary"].',
     inputSchema: {
       type: 'object',
       properties: {
@@ -893,6 +906,208 @@ function calculateEntropy(counts: Map<string, number>, total: number): number {
     if (p > 0) entropy -= p * Math.log2(p);
   }
   return entropy;
+}
+
+// ---------------------------------------------------------------------------
+// BULK REPLACE AND THE ADDRESS SPACE
+// ---------------------------------------------------------------------------
+//
+// `graph_bulk_replace` is a find/replace over text columns, and one of those
+// columns is `title`. In this corpus a title is not just text: where it carries
+// a stable identifier ("H34 · …"), the identifier IS the address other agents
+// reach the node by (graph_approaches("H34"), references in prose, another
+// cycle's notes). `graph_rename` guards that address space one node at a time —
+// an identifier a live node wears may only be taken by the same batch that
+// draws a `supersedes` edge at its holder (`findAddressCapture`) — and
+// `graph_batch` pre-flights renames against the same rule.
+//
+// This tool reached the same column without passing either check. One
+// find/replace of "H21" → "H20" would re-create, in a single call and across
+// every node that matched, exactly the collisions the rule exists to prevent:
+// two live claims answering to H20, `graph_approaches("H20")` ambiguous, every
+// reference to either one broken. Nor did it report the move, so the writer
+// would not learn what they had done until the frontier started counting
+// `collidingIdentifiers`.
+//
+// The posture here mirrors graph_rename's, and reuses its selection rather than
+// writing a second one:
+//   - REPORT every identifier the run moves, drops or acquires (loose parser,
+//     the same shape graph_rename returns as `addressChange`);
+//   - REFUSE the run when a rewritten title would take an address a live node
+//     wears (strict parser, `findAddressCapture`), or would land two nodes on
+//     one identifier they did not already share.
+//
+// Refusal is whole-run rather than per-node on purpose. A half-applied
+// renumbering — the approaches moved to H20/1 and H20/2 while the claim above
+// them stayed at H21 — is worse than no renumbering at all, and skipping the
+// offending node is precisely how it would happen.
+//
+// The check judges the graph AS IT STANDS, which makes one legitimate shape
+// read as a capture: a run that vacates an address and fills it in the same
+// breath ({H20→H19}, {H21→H20}). That is refused, and should be. Address
+// surgery of that kind belongs in graph_rename inside a batch, where the
+// supersession that justifies it can be written alongside it.
+
+interface BulkAddressChange {
+  nodeId: string;
+  before: string;
+  after: string;
+  stableIdBefore: string | null;
+  stableIdAfter: string | null;
+  change: 'reassigned' | 'dropped' | 'acquired';
+}
+
+interface BulkIdentifierCapture {
+  /** The node whose rewritten title would take the address. */
+  nodeId: string;
+  attemptedTitle: string;
+  currentTitle: string;
+  stableId: string;
+  layer: 'claim' | 'approach';
+  ownedBy: AddressCapture['owners'];
+}
+
+interface BulkAddressReport {
+  /** Every identifier this run would move, drop or acquire. */
+  addressChanges: BulkAddressChange[];
+  /** Moves onto an address a live node still wears. */
+  captures: BulkIdentifierCapture[];
+  /** Identifiers this run would land two or more nodes on at once. */
+  collidingIdentifiers: Array<{
+    stableId: string;
+    layer: 'claim' | 'approach';
+    nodes: Array<{ id: string; title: string; trigger: string | null }>;
+  }>;
+}
+
+/** "H12" / "H12/3" from the LOOSE parser — reporting only, never a refusal. */
+function renderLooseStableId(title: string): string | null {
+  const p = looseStableId(title);
+  if (!p) return null;
+  return p.approachNum === null
+    ? `H${p.claimNum}`
+    : `H${p.claimNum}/${p.approachNum}`;
+}
+
+/** "H12" / "H12/3" from the STRICT parser — what actually holds an address. */
+function renderStrictStableId(title: string): string | null {
+  const p = parseStableId(title);
+  if (!p || p.claimNum === null) return null;
+  if (p.approachRequested && p.approachNum === null) return null;
+  return formatStableId(p.claimNum, p.approachNum);
+}
+
+function analyseBulkTitleChanges(
+  titleChanges: Array<{ nodeId: string; before: string; after: string }>,
+  index: GraphIndex,
+): BulkAddressReport {
+  const addressChanges: BulkAddressChange[] = [];
+  const captures: BulkIdentifierCapture[] = [];
+
+  for (const c of titleChanges) {
+    const stableIdBefore = renderLooseStableId(c.before);
+    const stableIdAfter = renderLooseStableId(c.after);
+    if (stableIdBefore !== stableIdAfter) {
+      addressChanges.push({
+        nodeId: c.nodeId,
+        before: c.before,
+        after: c.after,
+        stableIdBefore,
+        stableIdAfter,
+        change:
+          stableIdAfter === null
+            ? 'dropped'
+            : stableIdBefore === null
+              ? 'acquired'
+              : 'reassigned',
+      });
+    }
+
+    // The refusal asks the same question graph_rename asks, of the same
+    // selection, with no `supersedesInBatch`: a bulk replace draws no edges, so
+    // nothing in it can sanction taking an address.
+    const capture = findAddressCapture({
+      newTitle: c.after,
+      renamedNodeId: c.nodeId,
+      index,
+    });
+    if (capture) {
+      captures.push({
+        nodeId: c.nodeId,
+        attemptedTitle: c.after,
+        currentTitle: c.before,
+        stableId: capture.stableId,
+        layer: capture.layer,
+        ownedBy: capture.owners,
+      });
+    }
+  }
+
+  // Two nodes landing on ONE identifier inside this same run.
+  // `findAddressCapture` cannot see it: it asks who wears an address in the
+  // graph as it stands, and both of these are moving onto a free one. Nodes
+  // that ALREADY shared an identifier and move together keep sharing it — that
+  // collision is not this run's doing, and the frontier goes on reporting it.
+  const byNewId = new Map<string, typeof titleChanges>();
+  for (const c of titleChanges) {
+    const id = renderStrictStableId(c.after);
+    if (!id) continue;
+    const bucket = byNewId.get(id);
+    if (bucket) bucket.push(c);
+    else byNewId.set(id, [c]);
+  }
+  const collidingIdentifiers: BulkAddressReport['collidingIdentifiers'] = [];
+  for (const [stableId, group] of byNewId) {
+    if (group.length < 2) continue;
+    const before = new Set(group.map((c) => renderStrictStableId(c.before)));
+    if (before.size === 1 && !before.has(null)) continue;
+    collidingIdentifiers.push({
+      stableId,
+      layer: stableId.includes('/') ? 'approach' : 'claim',
+      nodes: group.map((c) => ({
+        id: c.nodeId,
+        title: c.after,
+        trigger: index.nodes.get(c.nodeId)?.trigger ?? null,
+      })),
+    });
+  }
+
+  return { addressChanges, captures, collidingIdentifiers };
+}
+
+/** The refusal, in words: what would be taken, from whom, and the way out. */
+function describeBulkAddressRefusal(report: BulkAddressReport): string {
+  const parts: string[] = [];
+  if (report.captures.length > 0) {
+    const first = report.captures[0];
+    parts.push(
+      `Refused: this replacement would rewrite ${report.captures.length} title(s) onto an identifier a live node already wears. ` +
+        describeAddressCapture({
+          stableId: first.stableId,
+          layer: first.layer,
+          owners: first.ownedBy,
+        }),
+    );
+    if (report.captures.length > 1) {
+      const rest = report.captures
+        .slice(1)
+        .map((c) => `${c.stableId} (taken by ${c.nodeId})`)
+        .join(', ');
+      parts.push(`The same applies to ${rest}.`);
+    }
+  }
+  if (report.collidingIdentifiers.length > 0) {
+    const where = report.collidingIdentifiers
+      .map((c) => `${c.stableId} (${c.nodes.map((n) => n.id).join(' and ')})`)
+      .join('; ');
+    parts.push(
+      `Refused: this replacement would land more than one node on ${where}. An identifier that names two nodes resolves to neither — graph_approaches reports it ambiguous and every reference to it in prose breaks.`,
+    );
+  }
+  parts.push(
+    'Nothing was written: the run was judged before it applied anything.',
+  );
+  return parts.join(' ');
 }
 
 export async function handleReflectionTools(
@@ -2126,14 +2341,70 @@ export async function handleReflectionTools(
         };
       }
 
-      const result = sqlite.bulkReplace({
+      // --- THE ADDRESS SPACE ---------------------------------------------
+      // `fields` includes `title` by default, so this tool rewrites the
+      // identifiers other agents resolve nodes by. Compute the whole run
+      // first, judge the titles it would produce, and only then write. See the
+      // block above `handleReflectionTools` for why the refusal is whole-run.
+      const dryRun = sqlite.bulkReplace({
         find,
         replace,
         replacements,
         fields,
         caseSensitive,
-        preview,
+        preview: true,
       });
+
+      let address: BulkAddressReport | null = null;
+      if (dryRun.titleChanges.length > 0) {
+        try {
+          address = analyseBulkTitleChanges(
+            dryRun.titleChanges,
+            loadGraphIndex(projectId),
+          );
+        } catch {
+          // Same posture as the batch guard: a check that cannot read the
+          // graph does not get to block the run.
+          address = null;
+        }
+      }
+      const refused =
+        address !== null &&
+        (address.captures.length > 0 ||
+          address.collidingIdentifiers.length > 0);
+
+      if (refused && address && !preview) {
+        return {
+          success: false,
+          error: 'IDENTIFIER_IN_USE',
+          message: describeBulkAddressRefusal(address),
+          // Only the arrays that actually carry something: a refusal that
+          // lists an empty `identifierCaptures` reads as "no capture found"
+          // next to an error that says one was.
+          identifierCaptures:
+            address.captures.length > 0 ? address.captures : undefined,
+          collidingIdentifiers:
+            address.collidingIdentifiers.length > 0
+              ? address.collidingIdentifiers
+              : undefined,
+          addressChanges:
+            address.addressChanges.length > 0
+              ? address.addressChanges
+              : undefined,
+          hint: 'graph_bulk_replace is find/replace, not address surgery. To move a stable identifier deliberately, use graph_rename — inside one graph_batch with the `supersedes` edge when the address is being handed on, or onto a free number from graph_next_id. To rewrite the prose without touching the address space, pass fields: ["understanding", "content", "summary"].',
+        };
+      }
+
+      const result = preview
+        ? dryRun
+        : sqlite.bulkReplace({
+            find,
+            replace,
+            replacements,
+            fields,
+            caseSensitive,
+            preview: false,
+          });
 
       const affectedNodes = new Set(
         result.changes.map(
@@ -2147,6 +2418,21 @@ export async function handleReflectionTools(
         ),
       ).size;
 
+      const addressWarning = !address
+        ? undefined
+        : refused
+          ? `⚠️ WOULD BE REFUSED: ${describeBulkAddressRefusal(address)}`
+          : address.addressChanges.length > 0
+            ? `⚠️ ADDRESS SPACE: this ${preview ? 'would move' : 'moved'} the stable identifier of ${address.addressChanges.length} node(s) — ${address.addressChanges
+                .map(
+                  (c) =>
+                    `${c.stableIdBefore ?? '(none)'} → ${c.stableIdAfter ?? '(none)'}`,
+                )
+                .join(
+                  ', ',
+                )}. Anything that referred to those nodes by name — prose, graph_approaches, another cycle's notes — now resolves elsewhere or not at all.`
+            : undefined;
+
       return {
         success: true,
         preview: result.preview,
@@ -2155,11 +2441,26 @@ export async function handleReflectionTools(
         nodesAffected: affectedNodes,
         summary: result.summary,
         changes: result.changes.slice(0, 50), // Limit to first 50 changes
+        addressChanges:
+          address && address.addressChanges.length > 0
+            ? address.addressChanges
+            : undefined,
+        identifierCaptures:
+          address && address.captures.length > 0 ? address.captures : undefined,
+        collidingIdentifiers:
+          address && address.collidingIdentifiers.length > 0
+            ? address.collidingIdentifiers
+            : undefined,
+        addressWarning,
         message: result.preview
-          ? `Found ${result.matchCount} occurrences. Set preview: false to apply.`
+          ? refused
+            ? `Found ${result.matchCount} occurrences, but applying them would be REFUSED: the run takes a stable identifier that is already in use.`
+            : `Found ${result.matchCount} occurrences. Set preview: false to apply.`
           : `Applied ${result.matchCount} replacements across ${affectedNodes} nodes.`,
         hint: result.preview
-          ? 'Review changes above, then call with preview: false to apply'
+          ? refused
+            ? 'Fix the identifier collision first — graph_rename moves an address deliberately, graph_next_id issues a free number — or narrow `fields` to leave titles alone.'
+            : 'Review changes above, then call with preview: false to apply'
           : 'Changes applied and logged to event history',
       };
     }
