@@ -3131,44 +3131,34 @@ export class GraphStore {
   }
 
   /**
-   * Rename a node (update its title field)
-   * Returns the updated node or null if not found
+   * Rename a node (update its title field).
+   * Returns the updated node or null if not found.
+   *
+   * Goes through `updateNode` rather than a bare UPDATE: in a graph whose
+   * titles carry the stable identifier ("H34 · …"), the title IS the address
+   * other nodes and later sessions resolve by. A rename that leaves no
+   * revision puts the previous address in the event log only — invisible to
+   * anyone reading the node itself, which is exactly where someone looks when
+   * a reference stops resolving. The old title now lands in `revisions` and
+   * `version` increments, like every other edit of a node's substance.
    */
-  renameNode(nodeId: string, newName: string): GraphNodeData | null {
-    const db = getDb();
+  renameNode(
+    nodeId: string,
+    newName: string,
+    options: { revisionWhy?: string; conversationId?: string } = {},
+  ): GraphNodeData | null {
     const node = this.getNode(nodeId);
-
     if (!node) {
       return null;
     }
 
-    const now = new Date().toISOString();
-
     const oldName = node.title;
-
-    db.prepare(`
-      UPDATE nodes
-      SET title = ?, updated_at = ?
-      WHERE id = ?
-    `).run(newName, now, nodeId);
-
-    // Update cache
-    node.title = newName;
-    node.updatedAt = now;
-
-    logEvent(
-      'revised',
-      'node',
-      nodeId,
-      null,
-      `Renamed from "${oldName}" to "${newName}"`,
-      {
-        oldName,
-        newName,
-      },
-    );
-
-    return node;
+    return this.updateNode(nodeId, {
+      title: newName,
+      revisionWhy:
+        options.revisionWhy || `Renamed from "${oldName}" to "${newName}"`,
+      conversationId: options.conversationId,
+    });
   }
 }
 

@@ -123,7 +123,19 @@ export async function handleToolCall(
     name === 'graph_supersede' ||
     name === 'graph_add_reference' ||
     name === 'node_set_metadata' ||
-    name === 'node_get_metadata'
+    name === 'node_get_metadata' ||
+    // Declared in conceptTools and fully implemented in handleConceptTools,
+    // but missing here — so every call landed in the "Unknown tool" throw at
+    // the bottom of this function. `node_set_trigger` being unreachable is why
+    // a mis-classified node could not be repaired at all.
+    name === 'node_set_trigger' ||
+    name === 'graph_archive' ||
+    // `graph_rename` rewrites the title, and in this corpus the title carries
+    // the stable identifier — so it is an edit of the address space, not
+    // cosmetics. It is routed here as it stands; what it does NOT check is
+    // pinned in second-layer.test.ts under "graph_rename edits the address
+    // space".
+    name === 'graph_rename'
   ) {
     return handleConceptTools(name, args, contextManager);
   }

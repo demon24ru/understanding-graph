@@ -80,7 +80,7 @@ Use for:
 PARAMETER NAMES (these are strict — wrong names fail silently):
   graph_add_concept: { title, trigger, understanding, why }  — NOT name/body/text
   graph_connect:     { from, to, type, why }                 — NOT source/target/edgeType
-  graph_revise:      { node, understanding, before, after, pivot, why }
+  graph_revise:      { node, understanding, before, after, pivot, why, trigger? }
   doc_create:        { title, content, fileType, isDocRoot, parentId, afterId, level }
 
 Supports variable references: use "$N.id" to reference result N's id (0-indexed, counts ALL operations).

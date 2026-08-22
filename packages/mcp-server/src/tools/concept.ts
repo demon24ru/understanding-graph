@@ -5,6 +5,36 @@ import {
 } from '@emergent-wisdom/understanding-graph-core';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
+import { isSuperseded, loadGraphIndex, looseStableId } from './layers.js';
+
+/**
+ * Every trigger a node may carry — the ONE list. Creation
+ * (`graph_add_concept`) and correction (`graph_revise`) validate against it,
+ * so a trigger that cannot be created can never be reached by revising either.
+ */
+const VALID_TRIGGERS: string[] = [
+  'foundation',
+  'surprise',
+  'tension',
+  'consequence',
+  'repetition',
+  'question',
+  'serendipity',
+  'decision',
+  'experiment',
+  'analysis',
+  'randomness',
+  'reference',
+  'library',
+  'prediction',
+  'hypothesis',
+  'model',
+  'evaluation',
+  'thinking', // Reserved for synthesizer only
+];
+
+/** What a writer may choose: `thinking` belongs to the synthesizer alone. */
+const WRITABLE_TRIGGERS = VALID_TRIGGERS.filter((t) => t !== 'thinking');
 
 // Similarity thresholds for duplicate detection
 const SIMILARITY_THRESHOLDS = {
@@ -157,6 +187,11 @@ EPISTEMIC JOURNEY (recommended for significant revisions):
 
 These fields are stored in revision history, making understanding evolution visible.
 
+TRIGGER CORRECTION (optional): pass "trigger" to reclassify the node in place —
+a claim written as \`analysis\` never reaches the frontier, and superseding it
+just to fix the classification inflates the corpus. The old trigger stays
+visible in the revision history together with your \`why\`.
+
 WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose use doc_revise instead.`,
     inputSchema: {
       type: 'object',
@@ -185,6 +220,12 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
           type: 'string',
           description:
             'EPISTEMIC JOURNEY: The key insight or evidence that caused the shift. Example: "Profiling showed 80% time in SQL"',
+        },
+        trigger: {
+          type: 'string',
+          enum: WRITABLE_TRIGGERS,
+          description:
+            'OPTIONAL: correct the trigger of this node. Omit to leave the classification exactly as it is. Use it to repair a mis-classified node (e.g. a claim written as "analysis", which the two-layer frontier can never see) instead of superseding it with a near-duplicate. The previous trigger is kept in the revision history.',
         },
         references: {
           type: 'array',
@@ -357,7 +398,7 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
   {
     name: 'graph_rename',
     description:
-      'Rename a node (update its text/name). Use this to change character names, place names, concept names, etc. Documents using soft references ({{char:id}}) will automatically resolve to the new name on regeneration.',
+      'Rename a node (update its text/name). Use this to change character names, place names, concept names, etc. Documents using soft references ({{char:id}}) will automatically resolve to the new name on regeneration. WHERE TITLES CARRY A STABLE IDENTIFIER ("H34 · …") A RENAME EDITS THE ADDRESS SPACE: the result reports `addressChange` (identifier kept / reassigned / dropped / acquired) and, when the new identifier is already worn by another live node, `addressWarning` naming it. Nothing is refused — the previous title is preserved in the revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -368,6 +409,11 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
         newName: {
           type: 'string',
           description: 'The new name for the node',
+        },
+        why: {
+          type: 'string',
+          description:
+            'Why the node is being renamed. Stored as the reason on the revision that keeps the previous title; defaults to "Renamed from X to Y".',
         },
         project: {
           type: 'string',
@@ -533,31 +579,11 @@ export async function handleConceptTools(
       }
 
       // Validate trigger is a valid value
-      const validTriggers = [
-        'foundation',
-        'surprise',
-        'tension',
-        'consequence',
-        'repetition',
-        'question',
-        'serendipity',
-        'decision',
-        'experiment',
-        'analysis',
-        'randomness',
-        'reference',
-        'library',
-        'prediction',
-        'hypothesis',
-        'model',
-        'evaluation',
-        'thinking', // Reserved for synthesizer only
-      ];
-      if (!validTriggers.includes(trigger)) {
+      if (!VALID_TRIGGERS.includes(trigger)) {
         return {
           success: false,
           error: 'INVALID_TRIGGER',
-          message: `Invalid trigger "${trigger}". Valid triggers: ${validTriggers.filter((t) => t !== 'thinking').join(', ')}`,
+          message: `Invalid trigger "${trigger}". Valid triggers: ${WRITABLE_TRIGGERS.join(', ')}`,
           hint: 'Choose a trigger that describes why you are adding this concept.',
         };
       }
@@ -704,6 +730,46 @@ export async function handleConceptTools(
         projectId,
       );
 
+      const store = getGraphStore();
+
+      // OPTIONAL trigger correction. Absent `trigger`, everything below behaves
+      // exactly as it did before this parameter existed.
+      const rawTrigger = args.trigger;
+      let newTrigger: TriggerType | undefined;
+      let oldTrigger: string | null = null;
+      if (
+        rawTrigger !== undefined &&
+        rawTrigger !== null &&
+        rawTrigger !== ''
+      ) {
+        if (
+          typeof rawTrigger !== 'string' ||
+          !VALID_TRIGGERS.includes(rawTrigger)
+        ) {
+          return {
+            success: false,
+            error: 'INVALID_TRIGGER',
+            message: `Invalid trigger "${String(rawTrigger)}". Valid triggers: ${WRITABLE_TRIGGERS.join(', ')}`,
+            hint: 'Omit `trigger` entirely to revise the understanding without touching the classification.',
+          };
+        }
+        // Same restriction as creation: `thinking` is the synthesizer's alone,
+        // and a revision must not become the way around it.
+        if (
+          rawTrigger === 'thinking' &&
+          (args.agent_name as string | undefined) !== 'synthesizer'
+        ) {
+          return {
+            success: false,
+            error: 'FORBIDDEN_TRIGGER',
+            message: `trigger "thinking" is reserved for the synthesizer agent only. Agent "${(args.agent_name as string) || 'unknown'}" cannot set it.`,
+            hint: 'Choose one of: analysis, evaluation, tension, question, ...',
+          };
+        }
+        newTrigger = rawTrigger as TriggerType;
+        oldTrigger = store.getNode(resolved.id)?.trigger ?? null;
+      }
+
       // Extract epistemic journey fields
       const before = args.before as string | undefined;
       const after = args.after as string | undefined;
@@ -721,13 +787,20 @@ export async function handleConceptTools(
 
       // Build revision why - include epistemic journey if provided
       const baseWhy = args.why as string;
-      const fullRevisionWhy = epistemicJourney
+      const withJourney = epistemicJourney
         ? `${baseWhy}\n\n[Epistemic Journey]\n${epistemicJourney}`
         : baseWhy;
+      // The reclassification is spelled out in the revision reason as well, so
+      // node_get_revisions reads "why" and "from what to what" in one place.
+      const fullRevisionWhy =
+        newTrigger && newTrigger !== oldTrigger
+          ? `${withJourney}\n\n[Trigger] ${oldTrigger ?? 'none'} → ${newTrigger}`
+          : withJourney;
 
       // Build update payload - only include fields that were provided
       const updatePayload: {
         understanding?: string;
+        trigger?: TriggerType;
         references?: Array<{
           project?: string;
           nodeId?: string;
@@ -749,6 +822,9 @@ export async function handleConceptTools(
       if (args.understanding) {
         updatePayload.understanding = args.understanding as string;
       }
+      if (newTrigger) {
+        updatePayload.trigger = newTrigger;
+      }
       if (args.references) {
         updatePayload.references = args.references as Array<{
           project?: string;
@@ -766,7 +842,6 @@ export async function handleConceptTools(
         if (pivot) updatePayload.epistemicJourney.pivot = pivot;
       }
 
-      const store = getGraphStore();
       const node = store.updateNode(resolved.id, updatePayload);
 
       const response: Record<string, unknown> = {
@@ -776,6 +851,12 @@ export async function handleConceptTools(
         version: node.version,
         message: `Revised concept "${node.title}" (now version ${node.version})`,
       };
+
+      if (newTrigger) {
+        response.oldTrigger = oldTrigger;
+        response.newTrigger = node.trigger;
+        response.message = `Revised concept "${node.title}" (now version ${node.version}); trigger ${oldTrigger ?? 'none'} → ${node.trigger}`;
+      }
 
       // Include epistemic journey in response if provided
       if (before || after || pivot) {
@@ -980,19 +1061,129 @@ export async function handleConceptTools(
       const oldName = resolved.title;
       const newName = args.newName as string;
 
-      const updated = store.renameNode(resolved.id, newName);
-
-      if (!updated) {
-        throw new Error(`Failed to rename node: ${resolved.id}`);
+      if (typeof newName !== 'string' || newName.trim() === '') {
+        return {
+          success: false,
+          error: 'MISSING_REQUIRED_FIELDS',
+          message: 'graph_rename requires a non-empty "newName".',
+          hint: 'Pass the full new title, including its stable identifier if the node carries one.',
+        };
       }
+
+      // --- ADDRESS SPACE -------------------------------------------------
+      // The title carries the stable identifier, and identifiers are resolved
+      // BY TITLE (graph_approaches, resolveClaim). So a rename can move an
+      // address, delete one, or point a second node at an address already in
+      // use — and the batch allocator that issues numbers never sees a rename.
+      // Nothing here refuses anything: whether a taken identifier may be
+      // re-used is corpus policy, not a defect. It is reported, in the same
+      // shape the frontier reports `collidingIdentifiers`, so the writer sees
+      // what they just did to the address space.
+      const idBefore = looseStableId(oldName);
+      const idAfter = looseStableId(newName);
+      const render = (
+        p: { claimNum: number; approachNum: number | null } | null,
+      ) =>
+        p === null
+          ? null
+          : p.approachNum === null
+            ? `H${p.claimNum}`
+            : `H${p.claimNum}/${p.approachNum}`;
+      const stableIdBefore = render(idBefore);
+      const stableIdAfter = render(idAfter);
+
+      const sharesIdentifierWith: Array<{
+        id: string;
+        title: string;
+        trigger: string | null;
+        createdAt: string;
+      }> = [];
+      if (stableIdAfter) {
+        try {
+          const index = loadGraphIndex(projectId);
+          for (const n of index.nodes.values()) {
+            if (n.id === resolved.id) continue;
+            if (render(looseStableId(n.title)) !== stableIdAfter) continue;
+            // A re-specification keeps the identifier on purpose; the node it
+            // replaced is not a rival for the name.
+            if (isSuperseded(n.id, index)) continue;
+            sharesIdentifierWith.push({
+              id: n.id,
+              title:
+                n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
+              trigger: n.trigger,
+              createdAt: n.createdAt,
+            });
+          }
+        } catch {
+          // A diagnostic must never be the reason a rename fails.
+        }
+      }
+
+      const change =
+        stableIdBefore === stableIdAfter
+          ? 'kept'
+          : stableIdAfter === null
+            ? 'dropped'
+            : stableIdBefore === null
+              ? 'acquired'
+              : 'reassigned';
+
+      const notes: string[] = [];
+      if (change === 'reassigned') {
+        notes.push(
+          `⚠️ ADDRESS MOVED: this node answered to ${stableIdBefore} and now answers to ${stableIdAfter}. Anything that referred to it by name — prose, graph_approaches, another cycle's notes — now resolves elsewhere or not at all.`,
+        );
+      } else if (change === 'dropped') {
+        notes.push(
+          `⚠️ IDENTIFIER DROPPED: the node carried ${stableIdBefore} and the new title carries none, so graph_approaches("${stableIdBefore}") can no longer reach it. Its edges are unaffected; only resolution by name is.`,
+        );
+      } else if (change === 'acquired') {
+        notes.push(
+          `NOTE: the node now carries ${stableIdAfter}, which it did not before.`,
+        );
+      }
+      if (sharesIdentifierWith.length > 0) {
+        notes.push(
+          `⚠️ IDENTIFIER ALREADY IN USE: ${stableIdAfter} is worn by ${sharesIdentifierWith.length} other live node(s) — ${sharesIdentifierWith
+            .map((n) => `${n.id} ("${n.title.slice(0, 70)}")`)
+            .join(
+              ', ',
+            )}. That identifier now names more than one node and cannot be resolved by name at all; graph_frontier reports it under collidingIdentifiers. Nothing was refused: give one of them a free number (graph_next_id issues one), or connect them with a \`supersedes\` edge if this is a re-specification.`,
+        );
+      }
+
+      // Through `updateNode`, exactly like `graph_revise` and
+      // `node_set_trigger`: the previous title — which in this corpus is the
+      // previous ADDRESS — lands in `revisions` and `version` increments, so a
+      // reference that stopped resolving can be traced from the node itself
+      // rather than only from the event log. `GraphStore.renameNode` now takes
+      // the same path for every other caller.
+      const updated = store.updateNode(resolved.id, {
+        title: newName,
+        revisionWhy:
+          typeof args.why === 'string' && args.why.trim() !== ''
+            ? (args.why as string)
+            : `Renamed from "${oldName}" to "${newName}"`,
+        conversationId,
+      });
 
       return {
         success: true,
         id: updated.id,
         oldName,
         newName: updated.title,
+        version: updated.version,
+        addressChange: {
+          stableIdBefore,
+          stableIdAfter,
+          change,
+          sharesIdentifierWith:
+            sharesIdentifierWith.length > 0 ? sharesIdentifierWith : undefined,
+        },
+        addressWarning: notes.length > 0 ? notes.join(' ') : undefined,
         message: `Renamed "${oldName}" to "${updated.title}"`,
-        hint: 'Documents using soft references ({{char:id}}, {{concept:id}}, etc.) will automatically resolve to the new name on regeneration with doc_generate.',
+        hint: 'The previous title is kept in the revision history (node_get_revisions). Documents using soft references ({{char:id}}, {{concept:id}}, etc.) will automatically resolve to the new name on regeneration with doc_generate.',
       };
     }
 

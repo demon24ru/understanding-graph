@@ -53,6 +53,47 @@ export const APPROACH_TRIGGER = 'experiment';
 /** Triggers the convention uses for layer 1. */
 export const CLAIM_TRIGGERS = ['prediction', 'question'] as const;
 
+/**
+ * WIDE stable-id matcher — deliberately looser than `parseStableId`, and used
+ * for ONE thing: finding nodes that carry an identifier but sit in neither
+ * layer.
+ *
+ * WHY IT MUST BE LOOSER. `parseStableId` demands the canonical "H12 · " form
+ * because it feeds identifier ALLOCATION and collision detection, where a
+ * false positive renames a node or declares a collision that does not exist.
+ * The unlayered scan has the opposite problem. A node outside both layers is,
+ * by definition, a node somebody wrote outside the convention — so demanding
+ * the canonical separator from it is looking for what was lost only where the
+ * light is. Measured against the live corpus, the strict form found one of the
+ * eight dark lines; the seven it missed read
+ *
+ *   "H9 В СВОЕЙ БУКВЕ НЕЗАКРЫВАЕМА …"        (space)
+ *   "H15 REFUTED-AS-STATED by blind verify…" (space)
+ *   "H18-ПОПРАВКА · Из четырёх заявленных …" (hyphen before the dot)
+ *   "H24's closure is attribution-bookkeeping…" (apostrophe)
+ *   "H31/3 РАСШИРЕН (цикл 15…)"               (space, approach-level)
+ *
+ * So: the leading token `H<n>` or `H<n>/<k>`, followed by any boundary that is
+ * not a continuation of the number itself. `H4-БЕЗУСЛОВНАЯ` and `H20-Б` parse
+ * as H4 and H20; `H2O` and `H1B` do not parse at all, because a letter glued
+ * to the digits is not a boundary.
+ *
+ * Nothing here feeds allocation, renaming or collisions — only reporting.
+ */
+const LOOSE_STABLE_ID_RE =
+  /^\s*H(\d+)(?:\/(\d+))?(?=$|[\s·•'’‘ʼ"«»:;,.()[\]–—-])/i;
+
+export function looseStableId(
+  title: string,
+): { claimNum: number; approachNum: number | null } | null {
+  const m = LOOSE_STABLE_ID_RE.exec(title || '');
+  if (!m) return null;
+  return {
+    claimNum: Number.parseInt(m[1], 10),
+    approachNum: m[2] === undefined ? null : Number.parseInt(m[2], 10),
+  };
+}
+
 export type NodeStatus =
   | 'open'
   | 'confirmed'
@@ -513,7 +554,7 @@ export const layerTools: Tool[] = [
   {
     name: 'graph_frontier',
     description:
-      'THE FRONTIER IN ONE CALL: open claims (predictions/questions with no adjudicating edge) AND open approaches (experiment nodes with no adjudicating edge), with each approach attributed to the claim it implements. Answers both "what is not yet established?" and "what has not yet been tried on it?". Claims with no open approach are called out separately — those are the ones needing a new way in. Use this to open an inspiration/planning stage.',
+      'THE FRONTIER IN ONE CALL: open claims (predictions/questions with no adjudicating edge) AND open approaches (experiment nodes with no adjudicating edge), with each approach attributed to the claim it implements. Answers both "what is not yet established?" and "what has not yet been tried on it?". Claims with no open approach are called out separately — those are the ones needing a new way in. Also reports `unlayered`: open nodes whose title leads with a stable id in ANY form ("H21 …", "H18-ПОПРАВКА · …", "H24\'s …", "H31/3 …") but whose trigger puts them in neither layer (e.g. a re-opening written as `analysis`), flagged `lineIsDark` when nothing else on that H-number is open and visible — a research line that left the queue without anyone noticing. Use this to open an inspiration/planning stage.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -755,6 +796,79 @@ export async function handleLayerTools(
         })
         .filter((x): x is NonNullable<typeof x> => x !== null);
 
+      // ---------------------------------------------------------------------
+      // Nodes that carry a stable identifier but belong to NEITHER layer.
+      //
+      // "H21 НИКОГДА НЕ БЫЛА ПРОВЕРЕНА: …" written with trigger `analysis` is
+      // not a claim and not an approach, so no layer query has ever returned
+      // it. It is not archived, it is findable by search, and it is nowhere in
+      // the work queue — the research line goes quiet and nobody notices. The
+      // frontier is the one call every planning stage makes, so this is where
+      // they have to surface.
+      //
+      // The scan uses `looseStableId`, not `parseStableId`: see the comment on
+      // the matcher for why the strict form is exactly the wrong tool here.
+      // ---------------------------------------------------------------------
+      const isLayerTrigger = (t: string | null) =>
+        claimTriggers.includes(t ?? '') || t === APPROACH_TRIGGER;
+
+      // Which H-numbers still have work the frontier can actually see: an open
+      // claim, or an open approach whose claim was found. Anything else on that
+      // number is a DARK line — the record is live but nothing about it is
+      // queued anywhere. Deliberately computed over ALL nodes rather than the
+      // filtered lists above, so `titleContains` narrows what is reported and
+      // never what counts as alive.
+      const linesWithLiveWork = new Set<number>();
+      const unlayeredNodes: Array<{
+        node: GraphIndexNode;
+        claimNum: number;
+        approachNum: number | null;
+      }> = [];
+
+      for (const n of allNodes) {
+        const parsed = looseStableId(n.title);
+        if (!parsed) continue;
+        if (isLayerTrigger(n.trigger)) {
+          if (!isOpen(n.id, index, n.trigger)) continue;
+          // An open approach that belongs to no claim is already reported as
+          // `unattached`; it does not keep its line alive.
+          if (n.trigger === APPROACH_TRIGGER && !claimOf.get(n.id)) continue;
+          linesWithLiveWork.add(parsed.claimNum);
+          continue;
+        }
+        if (!isOpen(n.id, index, n.trigger)) continue;
+        unlayeredNodes.push({
+          node: n,
+          claimNum: parsed.claimNum,
+          approachNum: parsed.approachNum,
+        });
+      }
+
+      unlayeredNodes.sort(
+        (a, b) =>
+          a.claimNum - b.claimNum ||
+          a.node.createdAt.localeCompare(b.node.createdAt),
+      );
+      const darkLines = [
+        ...new Set(
+          unlayeredNodes
+            .filter((n) => !linesWithLiveWork.has(n.claimNum))
+            .map((n) => n.claimNum),
+        ),
+      ].map((num) => formatStableId(num));
+      const unlayered = unlayeredNodes.map(
+        ({ node: n, claimNum, approachNum }) => ({
+          id: n.id,
+          name: n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
+          trigger: n.trigger,
+          stableId: formatStableId(claimNum, approachNum),
+          createdAt: n.createdAt,
+          // true = the whole H-line is dark: this open record is the only thing
+          // left on that number and no query will ever hand it to anyone.
+          lineIsDark: !linesWithLiveWork.has(claimNum),
+        }),
+      );
+
       return {
         project: projectId,
         isExternal,
@@ -769,8 +883,12 @@ export async function handleLayerTools(
           openApproachesUnderClosedClaims: strandedByAVerdict.length,
           collidingIdentifiers: idCollisions.length,
           approachesImplementingSeveralClaims: ambiguouslyAttributed.length,
+          unlayered: unlayered.length,
+          darkLines: darkLines.length,
         },
         collidingIdentifiers: idCollisions,
+        unlayered: unlayered.slice(0, limit),
+        darkLines: darkLines.slice(0, limit),
         approachesImplementingSeveralClaims: ambiguouslyAttributed,
         openClaims: openClaimNodes.slice(0, limit).map((c) => ({
           id: c.id,
@@ -799,6 +917,14 @@ export async function handleLayerTools(
                   ? ` ⚠️ collidingIdentifiers (${idCollisions.length}): ${idCollisions
                       .map((c) => c.stableId)
                       .join(', ')} each name more than one node, so those ids cannot be resolved by name at all. New nodes now get their number from the engine; these are the pre-existing ones and they are left exactly as written.`
+                  : ''
+              }${
+                unlayered.length > 0
+                  ? ` ⚠️ unlayered (${unlayered.length}): open nodes titled with a stable id but carrying neither a claim trigger (${claimTriggers.join('/')}) nor \`${APPROACH_TRIGGER}\` — they are in no layer, so no query ever queues them.${
+                      darkLines.length > 0
+                        ? ` Of those, ${darkLines.slice(0, limit).join(', ')} are DARK lines (lineIsDark): nothing else on that number is open and visible, so the line has silently left the queue. Give the record the trigger it should have had (graph_revise accepts \`trigger\`), or write the claim/approach it is really talking about.`
+                        : ' Each sits beside a live claim or approach on the same number, so the line itself is still queued — commentary, not a gap.'
+                    }`
                   : ''
               }`,
       };
