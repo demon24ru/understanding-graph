@@ -86,7 +86,13 @@ export class SyncPgClient {
 
   constructor(opts: SyncPgOptions) {
     this.schema = opts.schema;
-    this.callTimeoutMs = opts.callTimeoutMs ?? 60_000;
+    // `??` does not catch NaN, and `Atomics.wait` treats a NaN timeout as
+    // +Infinity — a call that blocks the whole process forever with no error,
+    // no CPU and no lock. Anything not finite and positive falls back.
+    this.callTimeoutMs =
+      Number.isFinite(opts.callTimeoutMs) && (opts.callTimeoutMs as number) > 0
+        ? (opts.callTimeoutMs as number)
+        : 60_000;
 
     const sab = new SharedArrayBuffer(4);
     this.signal = new Int32Array(sab);
@@ -122,30 +128,64 @@ export class SyncPgClient {
     }
     const id = this.nextId++;
 
+    const deadline = Date.now() + this.callTimeoutMs;
     Atomics.store(this.signal, 0, 0);
     this.worker.postMessage({ ...req, id });
 
-    const status = Atomics.wait(this.signal, 0, 0, this.callTimeoutMs);
-    if (status === 'timed-out') {
-      throw new Error(
-        `Postgres call timed out after ${this.callTimeoutMs} ms with no reply from the database worker. ` +
-          'Either the server is unreachable, or a statement exceeded UG_PG_STATEMENT_TIMEOUT_MS. ' +
-          `SQL: ${String(req.sql ?? req.op).slice(0, 200)}`,
-      );
-    }
+    // Wait for the reply *to this request*. The id check is load-bearing: a
+    // call that timed out earlier leaves its reply in the port queue, and the
+    // worker's late `Atomics.store(1)` can land after the next call has already
+    // reset the signal. Without matching ids, the next call woke up, took the
+    // stale message off the queue and returned somebody else's rows — an
+    // off-by-one that then persists for the life of the connection and reports
+    // no error at all. Stale replies are discarded here instead.
+    for (;;) {
+      const reply = this.takeReply(id);
+      if (reply) return SyncPgClient.unwrap(reply);
 
-    const message = receiveMessageOnPort(this.port);
-    if (!message) {
-      throw new Error(
-        'Postgres worker signalled completion but delivered no message. This is a bug in the sync bridge.',
-      );
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) throw this.timeoutError(req);
+
+      Atomics.store(this.signal, 0, 0);
+      // A reply may have been delivered between the drain above and this
+      // store, in which case the store just clobbered the worker's signal.
+      // Drain once more so that wakeup cannot be lost.
+      const raced = this.takeReply(id);
+      if (raced) return SyncPgClient.unwrap(raced);
+
+      if (Atomics.wait(this.signal, 0, 0, remaining) === 'timed-out') {
+        throw this.timeoutError(req);
+      }
     }
-    const reply = message.message as Reply;
+  }
+
+  /** Drain the port, returning the reply for `id` and discarding stale ones. */
+  private takeReply(id: number): Reply | null {
+    for (;;) {
+      const message = receiveMessageOnPort(this.port);
+      if (!message) return null;
+      const reply = message.message as Reply;
+      if (reply.id === id) return reply;
+      // Reply to a call that already gave up. Dropping it is the whole point.
+    }
+  }
+
+  private timeoutError(req: Record<string, unknown>): Error {
+    return new Error(
+      `Postgres call timed out after ${this.callTimeoutMs} ms with no reply from the database worker. ` +
+        'Either the server is unreachable, or a statement exceeded UG_PG_STATEMENT_TIMEOUT_MS. ' +
+        `SQL: ${String(req.sql ?? req.op).slice(0, 200)}`,
+    );
+  }
+
+  private static unwrap(reply: Reply): Reply {
     if (!reply.ok) {
       const e = reply.error;
-      const err = new Error(
-        e?.message ?? 'Unknown Postgres error',
-      ) as Error & { code?: string; detail?: string; hint?: string };
+      const err = new Error(e?.message ?? 'Unknown Postgres error') as Error & {
+        code?: string;
+        detail?: string;
+        hint?: string;
+      };
       err.code = e?.code;
       err.detail = e?.detail;
       err.hint = e?.hint;

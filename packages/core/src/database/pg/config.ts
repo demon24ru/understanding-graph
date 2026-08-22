@@ -44,13 +44,31 @@ function parseSsl(): PgConnectionConfig['ssl'] {
   return false;
 }
 
+/**
+ * A timeout read from the environment must never come back as NaN or as a
+ * non-positive number. `Number("")`, `Number("30s")` and `Number(undefined)`
+ * all produce values that survive `??` and then travel two places where they
+ * are catastrophic: into `pg` as `statement_timeout` (disabling the
+ * server-side bound) and into `Atomics.wait` as its timeout, where the spec
+ * turns NaN into +Infinity — a statement that waits forever at zero CPU with
+ * no lock and no error. One malformed env var is enough; hence the guard.
+ */
+function timeoutFromEnv(name: string, fallback: number): number {
+  const raw = process.env[name]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) {
+    throw new Error(
+      `${name}="${raw}" is not a positive number of milliseconds. ` +
+        'Leave it unset to use the default, or give it a finite value > 0.',
+    );
+  }
+  return Math.floor(n);
+}
+
 export function getPgConfig(): PgConnectionConfig {
-  const connectTimeout = Number(
-    process.env.UG_PG_CONNECT_TIMEOUT_MS ?? '15000',
-  );
-  const statementTimeout = Number(
-    process.env.UG_PG_STATEMENT_TIMEOUT_MS ?? '30000',
-  );
+  const connectTimeout = timeoutFromEnv('UG_PG_CONNECT_TIMEOUT_MS', 15000);
+  const statementTimeout = timeoutFromEnv('UG_PG_STATEMENT_TIMEOUT_MS', 30000);
 
   const url = process.env.UG_PG_URL?.trim();
   if (url) {

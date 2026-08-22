@@ -479,20 +479,42 @@ async function checkForDuplicates(
     return warnings; // Can't check without embeddings
   }
 
+  // Collect every query first and ask them together. Each semanticSearch call
+  // drags the whole embedding corpus out of the database (see
+  // GraphStore.semanticSearchMany); doing that once per concept made a batch
+  // of k concepts cost k full scans of an identical, unchanging table, and the
+  // sync bridge blocks the entire server for each one. One scan, k answers.
+  const checked: Array<{ index: number; name: string; query: string }> = [];
   for (let i = 0; i < operations.length; i++) {
     const op = operations[i];
-
-    // Only check graph_add_concept operations
     if (op.tool !== 'graph_add_concept') continue;
-
     const name = op.params.name as string;
     const understanding = op.params.understanding as string;
+    checked.push({
+      index: i,
+      name,
+      query: `${name}. ${understanding || ''}`.trim(),
+    });
+  }
+  if (checked.length === 0) return warnings;
 
-    // Create search query from name + understanding
-    const query = `${name}. ${understanding || ''}`.trim();
+  let allResults: Awaited<ReturnType<typeof store.semanticSearchMany>>;
+  try {
+    allResults = await store.semanticSearchMany(
+      checked.map((c) => c.query),
+      5,
+    );
+  } catch {
+    // If semantic search fails, continue without warnings — as before, the
+    // duplicate check is advisory and must never block a batch.
+    return warnings;
+  }
+
+  for (let k = 0; k < checked.length; k++) {
+    const { index: i, name } = checked[k];
 
     try {
-      const results = await store.semanticSearch(query, 5);
+      const results = allResults[k] ?? [];
 
       // Filter to those above threshold
       const similar = results.filter((r) => r.similarity >= threshold);
@@ -521,7 +543,42 @@ async function checkForDuplicates(
   return warnings;
 }
 
-export async function handleBatchTools(
+/**
+ * Only one graph_batch may be in flight at a time.
+ *
+ * The transactional section below is written on the assumption that "the MCP
+ * server handles requests serially" — it does not. `Server.setRequestHandler`
+ * dispatches every incoming JSON-RPC request as soon as it arrives, and this
+ * function awaits the embedding provider (network) in the middle of an open
+ * BEGIN…COMMIT. A second request arriving during that await runs its
+ * statements on the SAME Postgres session, inside the first batch's
+ * transaction; a second graph_batch nests through SAVEPOINT and its COMMIT
+ * releases the other batch's savepoint. With four subagents writing to the
+ * graph at once — the normal case here — atomicity was whatever the
+ * interleaving happened to produce.
+ *
+ * Serialising graph_batch restores the premise the transaction code depends
+ * on. It is a queue, not a lock on the database: read-only tools are
+ * unaffected, and the wait is bounded by the batch ahead of it.
+ */
+let batchQueue: Promise<unknown> = Promise.resolve();
+
+export function handleBatchTools(
+  name: string,
+  args: Record<string, unknown>,
+  contextManager: ContextManager,
+): Promise<unknown> {
+  const run = batchQueue.then(
+    () => runBatchTool(name, args, contextManager),
+    () => runBatchTool(name, args, contextManager),
+  );
+  // The queue must not inherit this call's rejection, or one failed batch
+  // would reject every batch queued behind it.
+  batchQueue = run.catch(() => undefined);
+  return run;
+}
+
+async function runBatchTool(
   name: string,
   args: Record<string, unknown>,
   contextManager: ContextManager,

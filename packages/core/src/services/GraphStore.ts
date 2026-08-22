@@ -12,6 +12,7 @@ import {
   cosineSimilarity,
   embeddingToBuffer,
   generateEmbedding,
+  generateEmbeddings,
   generateNodeEmbedding,
 } from './EmbeddingService.js';
 
@@ -1575,6 +1576,52 @@ export class GraphStore {
     results.sort((a, b) => b.similarity - a.similarity);
 
     return results.slice(0, limit);
+  }
+
+  /**
+   * Score several queries against the corpus in ONE pass.
+   *
+   * `semanticSearch` reads every active node that has an embedding. On the
+   * Postgres backend that is not a memory read: pgvector is serialised as a
+   * text literal, so ~1500 floats per node cross the wire and are parsed back
+   * into Float32Array for every call — tens of megabytes on a corpus of a
+   * couple of thousand nodes, and the sync bridge blocks the entire MCP server
+   * process while it happens. Callers that ask k questions of the same corpus
+   * (graph_batch's duplicate check runs once per concept in the batch) were
+   * paying that k times over for one unchanging table.
+   *
+   * Same answers, same order, one scan.
+   */
+  async semanticSearchMany(
+    queries: string[],
+    limit = 10,
+  ): Promise<SemanticSearchResult[][]> {
+    if (queries.length === 0) return [];
+    if (queries.length === 1) return [await this.semanticSearch(queries[0], limit)];
+
+    const db = getDb();
+    const queryEmbeddings = await generateEmbeddings(queries);
+
+    const rows = db
+      .prepare(`
+      SELECT * FROM nodes WHERE active = 1 AND embedding IS NOT NULL
+    `)
+      .all() as Record<string, unknown>[];
+
+    const corpus: Array<{ node: GraphNodeData; embedding: Float32Array }> = [];
+    for (const row of rows) {
+      const node = this.rowToNode(row);
+      if (node.embedding) corpus.push({ node, embedding: node.embedding });
+    }
+
+    return queryEmbeddings.map((queryEmbedding) => {
+      const results: SemanticSearchResult[] = corpus.map((entry) => ({
+        node: entry.node,
+        similarity: cosineSimilarity(queryEmbedding, entry.embedding),
+      }));
+      results.sort((a, b) => b.similarity - a.similarity);
+      return results.slice(0, limit);
+    });
   }
 
   /**
