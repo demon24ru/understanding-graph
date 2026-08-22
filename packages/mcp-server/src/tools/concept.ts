@@ -5,7 +5,9 @@ import {
 } from '@emergent-wisdom/understanding-graph-core';
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
+import type { GraphIndex } from './layers.js';
 import { isSuperseded, loadGraphIndex, looseStableId } from './layers.js';
+import { describeAddressCapture, findAddressCapture } from './stable-ids.js';
 
 /**
  * Every trigger a node may carry — the ONE list. Creation
@@ -398,7 +400,7 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
   {
     name: 'graph_rename',
     description:
-      'Rename a node (update its text/name). Use this to change character names, place names, concept names, etc. Documents using soft references ({{char:id}}) will automatically resolve to the new name on regeneration. WHERE TITLES CARRY A STABLE IDENTIFIER ("H34 · …") A RENAME EDITS THE ADDRESS SPACE: the result reports `addressChange` (identifier kept / reassigned / dropped / acquired) and, when the new identifier is already worn by another live node, `addressWarning` naming it. Nothing is refused — the previous title is preserved in the revision history.',
+      'EDITS THE ADDRESS SPACE OF THE CORPUS — not the text of a node. Where titles carry a stable identifier ("H34 · …") the title IS the address: other agents reach that node by it (graph_approaches("H34"), references in prose, another cycle\'s notes), so moving it silently breaks everything pointing there. WHAT THIS IS NOT: not a way to fix a typo you just made yourself, not a way to tidy up wording (use graph_revise for understanding, and leave the title alone), and not a way around a refusal from the id allocator — numbers are issued by the engine at creation, and graph_next_id hands out a free one. THE ONE LEGITIMATE CASE: a re-specification that keeps the identifier, renamed in ONE graph_batch that also draws a `supersedes` edge at the node currently holding it. Taking a live node\'s identifier any other way is REFUSED (error IDENTIFIER_IN_USE, naming the holder). Renames that keep the identifier, drop it, or take a free one go through, and the result reports `addressChange` (kept / reassigned / dropped / acquired) plus an `addressWarning` when the move costs somebody a reference. The previous title is kept in the revision history.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -426,7 +428,7 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
   {
     name: 'graph_archive',
     description:
-      'Archive (soft-delete) a node. The node is hidden from default context but preserved in history. Use for orphan nodes, outdated concepts, or cleanup.',
+      'REMOVES A NODE FROM EVERY QUERY (soft-delete): out of context, out of the frontier, out of search; the row survives in history, but nothing routine will surface it again. NEVER ARCHIVE SOMETHING FOR BEING WRONG. "We tried that and it did not work" is the most expensive knowledge in a corpus — it is what stops the next cycle repeating a dead approach — and archiving it is how that knowledge gets rediscovered the hard way. A refuted approach gets an `invalidates` edge; a superseded understanding gets `supersedes`; both keep the node visible with its verdict attached. Legitimate use is narrow: an accidental duplicate, a node created by mistake, debris that says nothing. If you are archiving to make the frontier look tidier, stop — the frontier is a work queue, and shortening it by hiding work is lying to whoever reads it next.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -449,7 +451,7 @@ WARNING: use "node" (NOT "nodeId"). Updates "understanding" field - for prose us
   {
     name: 'node_set_trigger',
     description:
-      "Change a node's trigger type. Use to reclassify nodes (e.g., foundation→analysis, foundation→tension).",
+      'Correct a MIS-CLASSIFICATION: the node was always this kind of thing and was filed as another (foundation→analysis, analysis→tension). WHAT THIS IS NOT: a way to move a node into another layer after the fact. A finding honestly written as `analysis` does not become a claim because its trigger now says `prediction` — a claim has to name a mechanism AND the evidence that would refute it, and a trigger change writes neither. If an observation deserves to be attacked, WRITE THE CLAIM and connect it to the observation (`learned_from`); the observation stays what it was. This is not theory: eight lines of research in this corpus fell out of the work queue precisely because a re-opening was recorded as an observation, and every one of them needed a claim written, not a trigger changed. Nor is it a way to hide a node from a query — `graph_find_by_trigger` and `graph_frontier` read triggers, so re-labelling to keep something out of the frontier is falsifying the queue.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -1074,11 +1076,37 @@ export async function handleConceptTools(
       // The title carries the stable identifier, and identifiers are resolved
       // BY TITLE (graph_approaches, resolveClaim). So a rename can move an
       // address, delete one, or point a second node at an address already in
-      // use — and the batch allocator that issues numbers never sees a rename.
-      // Nothing here refuses anything: whether a taken identifier may be
-      // re-used is corpus policy, not a defect. It is reported, in the same
-      // shape the frontier reports `collidingIdentifiers`, so the writer sees
-      // what they just did to the address space.
+      // use — and the batch allocator that issues numbers never sees a rename
+      // (`titleFieldFor` returns null for it).
+      //
+      // ONE thing is refused, and only one: taking an identifier a live node
+      // still wears, unless the same batch draws a `supersedes` edge at that
+      // node. See `findAddressCapture` for why that is the allocator's own
+      // policy rather than a new one, and for why the refusal uses the STRICT
+      // parser while everything reported below uses the loose one.
+      // Everything else — keeping an identifier, dropping one, taking a free
+      // one — goes through and is reported, in the same shape the frontier
+      // reports `collidingIdentifiers`.
+      let index: GraphIndex | null = null;
+      try {
+        index = loadGraphIndex(projectId);
+      } catch {
+        // A diagnostic must never be the reason a rename fails; and if the
+        // index cannot be read at all, the write below will fail anyway.
+        index = null;
+      }
+
+      // How graph_batch tells this handler what the REST of the batch does:
+      // the `supersedes` edge that legitimises a capture is a separate
+      // operation and may well run AFTER this one, so it cannot be seen in the
+      // graph from here. Absent — a bare graph_rename call — means "no batch,
+      // no edge, nothing sanctions this", which is the right default.
+      const supersedesInBatch = Array.isArray(args._supersedesInBatch)
+        ? (args._supersedesInBatch as unknown[]).filter(
+            (x): x is string => typeof x === 'string',
+          )
+        : [];
+
       const idBefore = looseStableId(oldName);
       const idAfter = looseStableId(newName);
       const render = (
@@ -1098,25 +1126,20 @@ export async function handleConceptTools(
         trigger: string | null;
         createdAt: string;
       }> = [];
-      if (stableIdAfter) {
-        try {
-          const index = loadGraphIndex(projectId);
-          for (const n of index.nodes.values()) {
-            if (n.id === resolved.id) continue;
-            if (render(looseStableId(n.title)) !== stableIdAfter) continue;
-            // A re-specification keeps the identifier on purpose; the node it
-            // replaced is not a rival for the name.
-            if (isSuperseded(n.id, index)) continue;
-            sharesIdentifierWith.push({
-              id: n.id,
-              title:
-                n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
-              trigger: n.trigger,
-              createdAt: n.createdAt,
-            });
-          }
-        } catch {
-          // A diagnostic must never be the reason a rename fails.
+      if (stableIdAfter && index) {
+        for (const n of index.nodes.values()) {
+          if (n.id === resolved.id) continue;
+          if (render(looseStableId(n.title)) !== stableIdAfter) continue;
+          // A re-specification keeps the identifier on purpose; the node it
+          // replaced is not a rival for the name.
+          if (isSuperseded(n.id, index)) continue;
+          sharesIdentifierWith.push({
+            id: n.id,
+            title:
+              n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
+            trigger: n.trigger,
+            createdAt: n.createdAt,
+          });
         }
       }
 
@@ -1144,13 +1167,41 @@ export async function handleConceptTools(
         );
       }
       if (sharesIdentifierWith.length > 0) {
-        notes.push(
-          `⚠️ IDENTIFIER ALREADY IN USE: ${stableIdAfter} is worn by ${sharesIdentifierWith.length} other live node(s) — ${sharesIdentifierWith
-            .map((n) => `${n.id} ("${n.title.slice(0, 70)}")`)
-            .join(
-              ', ',
-            )}. That identifier now names more than one node and cannot be resolved by name at all; graph_frontier reports it under collidingIdentifiers. Nothing was refused: give one of them a free number (graph_next_id issues one), or connect them with a \`supersedes\` edge if this is a re-specification.`,
+        const sanctioned = new Set(supersedesInBatch);
+        const handedOn = sharesIdentifierWith.every(
+          (n) => sanctioned.has(n.id) || sanctioned.has(n.title),
         );
+        const who = sharesIdentifierWith
+          .map((n) => `${n.id} ("${n.title.slice(0, 70)}")`)
+          .join(', ');
+        notes.push(
+          handedOn
+            ? `RE-SPECIFICATION: ${stableIdAfter} was worn by ${who}, and this same batch draws a \`supersedes\` edge at it — the address is being handed on, not contested, so the identifier keeps resolving to exactly one live node.`
+            : `⚠️ IDENTIFIER ALREADY IN USE: ${stableIdAfter} is worn by ${sharesIdentifierWith.length} other live node(s) — ${who}. That identifier now names more than one node and cannot be resolved by name at all; graph_frontier reports it under collidingIdentifiers. Give one of them a free number (graph_next_id issues one), or connect them with a \`supersedes\` edge if this is a re-specification.`,
+        );
+      }
+
+      // THE ONE REFUSAL: taking an address a live node still wears, with
+      // nothing in this batch superseding it.
+      const capture = index
+        ? findAddressCapture({
+            newTitle: newName,
+            renamedNodeId: resolved.id,
+            index,
+            supersedesInBatch,
+          })
+        : null;
+      if (capture) {
+        return {
+          success: false,
+          error: 'IDENTIFIER_IN_USE',
+          message: `Refused: ${describeAddressCapture(capture)}`,
+          stableId: capture.stableId,
+          ownedBy: capture.owners,
+          attemptedName: newName,
+          currentName: oldName,
+          hint: 'graph_rename edits the address space of the corpus. The identifier in the title is what other agents search by; taking one that is still in use is the one thing this tool will not do.',
+        };
       }
 
       // Through `updateNode`, exactly like `graph_revise` and

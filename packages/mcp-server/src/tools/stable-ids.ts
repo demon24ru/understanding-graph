@@ -196,19 +196,35 @@ function supersededIn(index: GraphIndex | undefined, nodeId: string): boolean {
  * claim that replaced it is one hypothesis with a history, not two claims
  * fighting over a number.
  */
+/**
+ * The nodes that actually HOLD an identifier right now: everything in the
+ * bucket minus whatever has been superseded. One selection, used by the
+ * collision report and by the rename guard, so "who owns H34" cannot mean two
+ * different things in two places.
+ */
+function liveHolders(
+  nodes: StableIdNode[],
+  index?: GraphIndex,
+): StableIdNode[] {
+  return nodes.filter((n) => !supersededIn(index, n.id));
+}
+
+function describeHolder(n: StableIdNode) {
+  return {
+    id: n.id,
+    title: n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
+    trigger: n.trigger,
+    createdAt: n.createdAt,
+  };
+}
+
 export function findIdCollisions(
   scan: StableIdScan,
   index?: GraphIndex,
 ): IdCollision[] {
   const out: IdCollision[] = [];
-  const live = (nodes: StableIdNode[]) =>
-    nodes.filter((n) => !supersededIn(index, n.id));
-  const describe = (n: StableIdNode) => ({
-    id: n.id,
-    title: n.title.length > 160 ? `${n.title.slice(0, 157)}...` : n.title,
-    trigger: n.trigger,
-    createdAt: n.createdAt,
-  });
+  const live = (nodes: StableIdNode[]) => liveHolders(nodes, index);
+  const describe = describeHolder;
 
   for (const [num, nodes] of scan.claims) {
     const remaining = live(nodes);
@@ -234,6 +250,109 @@ export function findIdCollisions(
     numeric: true,
   }));
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// Rename: taking an identifier that is already worn
+// ---------------------------------------------------------------------------
+
+export interface AddressCapture {
+  /** The identifier the new title would take: "H34" / "H34/2". */
+  stableId: string;
+  layer: 'claim' | 'approach';
+  /** The live nodes wearing it — the same selection findIdCollisions counts. */
+  owners: Array<{
+    id: string;
+    title: string;
+    trigger: string | null;
+    createdAt: string;
+  }>;
+}
+
+/**
+ * Would this rename take an identifier a live node already wears?
+ *
+ * The rule it serves: an identifier held by a live node may be taken only by
+ * the same batch that draws a `supersedes` edge at its holder. That is not a
+ * new policy — it is the allocator's policy, reached by the other road. At
+ * creation time `allocateStableIdsForBatch` renumbers a colliding title unless
+ * the batch supersedes the incumbent, because re-using the id is exactly what
+ * a re-specification is for. `graph_rename` is the one path that reaches the
+ * address space without passing the allocator (`titleFieldFor` returns null
+ * for it), so without this the whole allocator can be walked around in two
+ * calls: create with any free number, then rename onto the one you wanted.
+ *
+ * STRICT MATCHER ON PURPOSE, and the asymmetry with `looseStableId` is
+ * deliberate rather than an oversight:
+ *   - THE STRICT FORM DECIDES. Only the canonical "H34 · …" is treated as
+ *     taking an address, because a false positive here REFUSES a legitimate
+ *     rename. "H4-БЕЗУСЛОВНАЯ …" and "H15 REFUTED-AS-STATED …" are commentary
+ *     that mentions an identifier; refusing to retitle them would be a bug.
+ *   - THE LOOSE FORM REPORTS. `graph_rename` keeps computing `addressChange` /
+ *     `addressWarning` through `looseStableId`, so a near-miss form still gets
+ *     told what it did to the address space even when nothing is refused.
+ * Reporting too widely costs a sentence; refusing too widely costs a writer
+ * their edit, so the two matchers are tuned in opposite directions.
+ */
+export function findAddressCapture(args: {
+  /** The title the node is about to carry. */
+  newTitle: string;
+  /** The node being renamed; it never collides with itself. */
+  renamedNodeId: string;
+  index: GraphIndex;
+  /**
+   * Node ids (or titles) at which THIS batch draws a `supersedes` edge. A
+   * holder in this set has handed its identifier on, so taking it is the
+   * re-specification the convention is built around, not a capture.
+   */
+  supersedesInBatch?: Iterable<string>;
+}): AddressCapture | null {
+  const parsed = parseStableId(args.newTitle);
+  if (!parsed || parsed.claimNum === null) return null;
+  // "H12/?" asks the engine for a number rather than naming one; a rename
+  // cannot allocate, so it takes no address at all.
+  if (parsed.approachRequested && parsed.approachNum === null) return null;
+
+  const scan = scanStableIds(args.index);
+  const layer: 'claim' | 'approach' =
+    parsed.approachNum === null ? 'claim' : 'approach';
+  const bucket =
+    (layer === 'claim'
+      ? scan.claims.get(parsed.claimNum)
+      : scan.approaches.get(`${parsed.claimNum}/${parsed.approachNum}`)) ?? [];
+
+  const sanctioned = new Set(args.supersedesInBatch ?? []);
+  const owners = liveHolders(bucket, args.index).filter(
+    (n) =>
+      n.id !== args.renamedNodeId &&
+      !sanctioned.has(n.id) &&
+      !sanctioned.has(n.title),
+  );
+  if (owners.length === 0) return null;
+
+  return {
+    stableId: formatStableId(parsed.claimNum, parsed.approachNum),
+    layer,
+    owners: owners.map(describeHolder),
+  };
+}
+
+/** The refusal, in words: what is taken, by whom, and the two ways forward. */
+export function describeAddressCapture(capture: AddressCapture): string {
+  const who = capture.owners
+    .map((n) => `${n.id} ("${n.title.slice(0, 90)}")`)
+    .join(', ');
+  return (
+    `${capture.stableId} is the address of a live ${capture.layer}: ${who}. ` +
+    'An identifier can only be taken from its holder by the same batch that ' +
+    `draws a \`supersedes\` edge at it — that is what a re-specification is, and it is ` +
+    'the only case where two nodes may wear one address. ' +
+    `Either put this rename in one graph_batch together with graph_connect ` +
+    `{ type: "supersedes", to: "${capture.owners[0].id}" }, or give this node a free ` +
+    'number — graph_next_id issues one. Renaming onto a taken address without the edge ' +
+    'would make the identifier resolve to nothing: graph_approaches would report it ' +
+    'ambiguous and every reference to it in prose would break.'
+  );
 }
 
 /**

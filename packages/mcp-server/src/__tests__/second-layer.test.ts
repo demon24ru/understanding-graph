@@ -927,59 +927,232 @@ describe('graph_rename edits the address space', () => {
     );
   });
 
-  it('warns, but does NOT refuse, when the new identifier is already taken', async () => {
+  // THE RULE: an identifier a live node wears can only be taken by the same
+  // batch that supersedes that node. These four tests are the rule from all
+  // four sides — bare call, batch without the edge, batch with it, and the
+  // same batch with the edge target written as a back-reference.
+  it('REFUSES a bare rename onto an identifier a live claim wears', async () => {
     const ids = await seedTwoCanonicalClaims();
-
-    const before = await call('graph_frontier', {});
-    expect((before.counts as Record<string, number>).collidingIdentifiers).toBe(
-      0,
-    );
-    const resolvable = await call('graph_approaches', { claim: 'H80' });
-    expect((resolvable.claim as { id: string }).id).toBe(ids.h80);
 
     const res = await call('graph_rename', {
       node: ids.h81,
       newName: 'H80 · the second claim, now wearing H80',
       why: 'testing what the engine says about it',
     });
-    // The mutation goes through — refusing is corpus policy, not this fix.
+    expect(res.success).toBe(false);
+    expect(res.error).toBe('IDENTIFIER_IN_USE');
+    expect(res.stableId).toBe('H80');
+    // The refusal names the holder — id and title — and the way forward.
+    expect((res.ownedBy as Array<{ id: string }>).map((n) => n.id)).toEqual([
+      ids.h80,
+    ]);
+    const message = String(res.message);
+    expect(message).toContain(ids.h80);
+    expect(message).toContain('H80 · the first claim');
+    expect(message).toContain('supersedes');
+    expect(message).toContain('graph_next_id');
+
+    // Nothing moved: no write, no revision, no collision, and H80 still
+    // resolves to exactly one node.
+    const revs = (await call('node_get_revisions', {
+      nodeId: ids.h81,
+    })) as Res;
+    expect(revs.currentVersion).toBe(1);
+    const frontier = await call('graph_frontier', {});
+    expect(
+      (frontier.counts as Record<string, number>).collidingIdentifiers,
+    ).toBe(0);
+    const resolvable = await call('graph_approaches', { claim: 'H80' });
+    expect((resolvable.claim as { id: string }).id).toBe(ids.h80);
+  });
+
+  it('refuses the same capture inside a batch that draws no `supersedes`', async () => {
+    const ids = await seedTwoCanonicalClaims();
+    const res = await call('graph_batch', {
+      commit_message: 'take H80 without superseding it',
+      ignoreWarnings: true,
+      operations: [
+        {
+          tool: 'graph_rename',
+          params: { node: ids.h81, newName: 'H80 · taken by a batch' },
+        },
+        {
+          tool: 'graph_connect',
+          params: {
+            from: ids.h81,
+            to: ids.h80,
+            type: 'relates',
+            why: 'a `relates` edge is not a supersession',
+          },
+        },
+      ],
+    });
+    expect(res.success).toBe(false);
+    expect(res.error).toBe('IDENTIFIER_IN_USE');
+    expect(res.operationIndex).toBe(0);
+    expect(String(res.message)).toContain(ids.h80);
+
+    // Refused BEFORE the transaction opened: not even the edge was written.
+    const revs = (await call('node_get_revisions', {
+      nodeId: ids.h81,
+    })) as Res;
+    expect(revs.currentVersion).toBe(1);
+    const context = (await call('graph_context', { node: ids.h81 })) as Res;
+    expect(JSON.stringify(context)).not.toContain('a `relates` edge is not');
+  });
+
+  it('lets the capture through when the same batch supersedes the holder — even with the edge written after the rename', async () => {
+    const ids = await seedTwoCanonicalClaims();
+    const res = await call('graph_batch', {
+      commit_message: 're-specify H80; H81 takes the address it hands on',
+      ignoreWarnings: true,
+      operations: [
+        // The rename executes FIRST: at this point the edge below does not
+        // exist in the graph yet, which is exactly why the check reads the
+        // operation list rather than the graph.
+        {
+          tool: 'graph_rename',
+          params: {
+            node: ids.h81,
+            newName: 'H80 · the re-specification',
+            why: 're-specification of H80',
+          },
+        },
+        {
+          tool: 'graph_connect',
+          params: {
+            from: '$0.id',
+            to: ids.h80,
+            type: 'supersedes',
+            why: 'the re-specification replaces the original H80',
+          },
+        },
+      ],
+    });
     expect(res.success).toBe(true);
+    const renamed = (res.results as Res[])[0];
+    expect(renamed.success).toBe(true);
+    expect(renamed.newName).toBe('H80 · the re-specification');
+    // The report says the address was handed on, not contested.
+    expect(String(renamed.addressWarning)).toContain('RE-SPECIFICATION');
+    expect(String(renamed.addressWarning)).not.toContain('ALREADY IN USE');
 
-    // ...but the caller is told exactly what happened to the address space.
-    const addr = res.addressChange as {
-      stableIdBefore: string;
-      stableIdAfter: string;
-      change: string;
-      sharesIdentifierWith: Array<{ id: string; title: string }>;
-    };
-    expect(addr.stableIdBefore).toBe('H81');
-    expect(addr.stableIdAfter).toBe('H80');
-    expect(addr.change).toBe('reassigned');
-    expect(addr.sharesIdentifierWith.map((n) => n.id)).toEqual([ids.h80]);
-    expect(addr.sharesIdentifierWith[0].title).toBe('H80 · the first claim');
-    const warning = String(res.addressWarning);
-    expect(warning).toContain('ADDRESS MOVED');
-    expect(warning).toContain('IDENTIFIER ALREADY IN USE');
-    expect(warning).toContain(ids.h80);
+    // One live claim answers to H80, and it is the new one.
+    const frontier = await call('graph_frontier', {});
+    expect(
+      (frontier.counts as Record<string, number>).collidingIdentifiers,
+    ).toBe(0);
+    const resolved = await call('graph_approaches', { claim: 'H80' });
+    expect((resolved.claim as { id: string }).id).toBe(ids.h81);
+  });
 
-    // Two live claims now answer to H80...
-    const after = await call('graph_frontier', {});
-    expect((after.counts as Record<string, number>).collidingIdentifiers).toBe(
-      1,
-    );
-    const collisions = after.collidingIdentifiers as Array<{
-      stableId: string;
-      nodes: Array<{ id: string }>;
-    }>;
-    expect(collisions[0].stableId).toBe('H80');
-    expect(collisions[0].nodes.map((n) => n.id).sort()).toEqual(
-      [ids.h80, ids.h81].sort(),
-    );
+  it('resolves a "$N.id" edge target, so a legitimate batch is not refused for writing one', async () => {
+    const ids = await seedTwoCanonicalClaims();
+    const res = await call('graph_batch', {
+      commit_message: 're-specify H80, edge target written as "$0.id"',
+      ignoreWarnings: true,
+      operations: [
+        // op0 acts on the HOLDER, so "$0.id" is the holder's id — knowable
+        // before the batch runs, and the guard has to know it.
+        {
+          tool: 'graph_revise',
+          params: {
+            node: ids.h80,
+            understanding: 'H80 as first stated, kept for the record.',
+            why: 'note the incumbent before it is superseded',
+          },
+        },
+        {
+          tool: 'graph_rename',
+          params: {
+            node: ids.h81,
+            newName: 'H80 · the re-specification, by reference',
+            why: 're-specification of H80',
+          },
+        },
+        {
+          tool: 'graph_connect',
+          params: {
+            from: '$1.id',
+            to: '$0.id',
+            type: 'supersedes',
+            why: 'the re-specification replaces the original H80',
+          },
+        },
+      ],
+    });
+    expect(res.success).toBe(true);
+    const frontier = await call('graph_frontier', {});
+    expect(
+      (frontier.counts as Record<string, number>).collidingIdentifiers,
+    ).toBe(0);
+    const resolved = await call('graph_approaches', { claim: 'H80' });
+    expect((resolved.claim as { id: string }).id).toBe(ids.h81);
+  });
 
-    // ...so the identifier can no longer be resolved by name at all.
-    const broken = await call('graph_approaches', { claim: 'H80' });
-    expect(broken.success).toBe(false);
-    expect(broken.ambiguous).toBe(true);
+  it('does not count a SUPERSEDED node as the holder of its identifier', async () => {
+    const ids = await seedTwoCanonicalClaims();
+    // H80 hands its identifier on to a node that does not carry one, so
+    // nothing live wears H80 any more.
+    const handOff = (await call('graph_batch', {
+      commit_message:
+        'H80 is replaced by a claim written without an identifier',
+      ignoreWarnings: true,
+      operations: [
+        {
+          tool: 'graph_add_concept',
+          params: {
+            title: 'the replacement for the first claim',
+            trigger: 'prediction',
+            why: 'layer 1',
+            understanding: 'A holds, restated.',
+            skipDuplicateCheck: true,
+          },
+        },
+        {
+          tool: 'graph_connect',
+          params: {
+            from: '$0.id',
+            to: ids.h80,
+            type: 'supersedes',
+            why: 'replaces the first claim',
+          },
+        },
+      ],
+    })) as Res;
+    expect(handOff.success).toBe(true);
+
+    // ...so taking H80 is not a capture, and needs no edge of its own.
+    const res = await call('graph_rename', {
+      node: ids.h81,
+      newName: 'H80 · picked up an address nobody live was using',
+    });
+    expect(res.success).toBe(true);
+    expect(res.addressChange).toMatchObject({
+      stableIdBefore: 'H81',
+      stableIdAfter: 'H80',
+      change: 'reassigned',
+    });
+  });
+
+  it('leaves a rename onto a FREE identifier alone', async () => {
+    const ids = await seedTwoCanonicalClaims();
+    const res = await call('graph_rename', {
+      node: ids.h81,
+      newName: 'H82 · the second claim, renumbered by hand',
+      why: 'H81 was a duplicate of an older number',
+    });
+    expect(res.success).toBe(true);
+    expect(res.addressChange).toMatchObject({
+      stableIdBefore: 'H81',
+      stableIdAfter: 'H82',
+      change: 'reassigned',
+    });
+    // Moving an address is still reported — it is only taking a TAKEN one
+    // that is refused.
+    expect(String(res.addressWarning)).toContain('ADDRESS MOVED');
+    const resolved = await call('graph_approaches', { claim: 'H82' });
+    expect((resolved.claim as { id: string }).id).toBe(ids.h81);
   });
 
   it('says so when the rename drops the identifier altogether', async () => {

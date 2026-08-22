@@ -8,10 +8,13 @@ import {
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import type { ContextManager } from '../context-manager.js';
 import { handleToolCall } from './index.js';
+import type { GraphIndex } from './layers.js';
 import { checkPrematureInvalidation, loadGraphIndex } from './layers.js';
 import {
   type AllocationResult,
   allocateStableIdsForBatch,
+  describeAddressCapture,
+  findAddressCapture,
 } from './stable-ids.js';
 
 // Sentinel error class used by handleBatchTools to bubble an
@@ -230,6 +233,128 @@ const DEFAULT_DUPLICATE_THRESHOLD = 0.8;
  * graph via the union of new connect operations, then any new concept not
  * in that reachable set is orphaned.
  */
+/**
+ * RENAME AND THE ADDRESS SPACE — the pre-flight for the one rule graph_rename
+ * enforces: an identifier a live node still wears can only be taken by the
+ * same batch that draws a `supersedes` edge at that node.
+ *
+ * Why it lives HERE and not only in the handler: the `supersedes` edge is a
+ * separate operation, and operations execute in order, so the rename can run
+ * strictly BEFORE the edge exists. Asking "is there a supersedes edge at the
+ * owner?" of the graph state at rename time would refuse every legitimate
+ * re-specification whose edge happens to come second. So the question is asked
+ * of the OPERATION LIST, before anything executes — which also means a refused
+ * batch never opens a transaction and never has to be rolled back.
+ *
+ * `"$N.id"` edge targets are resolved statically: operation N is looked up in
+ * the list, and when it is a tool that acts on an EXISTING node (`node` /
+ * `nodeId` param — graph_rename, graph_revise, node_set_trigger,
+ * node_set_metadata, graph_archive) its result id is that node's id, which we
+ * can resolve now. A `$N.id` pointing at a node the batch CREATES needs no
+ * resolution: a node that does not exist yet cannot be the live owner of an
+ * address. graph_supersede is not in that set on purpose — its `$N.id` is the
+ * NEW node, not the superseded one (and it archives the old node anyway, so
+ * the old node stops being a live holder).
+ *
+ * Each surviving rename op is then handed the resolved target set through
+ * `_supersedesInBatch`, so the handler's own guard — the one that refuses a
+ * bare, batch-less graph_rename — sees what this batch does and stays quiet.
+ */
+function guardRenamesAgainstAddressCapture(
+  operations: Array<{ tool: string; params: Record<string, unknown> }>,
+  contextManager: ContextManager,
+): Record<string, unknown> | null {
+  const renames = operations
+    .map((op, i) => ({ op, i }))
+    .filter((x) => x.op.tool === 'graph_rename');
+  if (renames.length === 0) return null;
+
+  const projectId = contextManager.getCurrentProjectId();
+  let index: GraphIndex;
+  try {
+    index = loadGraphIndex(projectId);
+  } catch {
+    // Same posture as the allocator: a guard that cannot read the graph does
+    // not get to block the batch.
+    return null;
+  }
+
+  const resolveToId = (ref: string): string | null => {
+    try {
+      return contextManager.resolveNode(ref, projectId)?.id ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  /** The node id operation `idx` will return as `.id`, when it is knowable. */
+  const staticIdOfOp = (idx: number): string | null => {
+    const target = operations[idx];
+    if (!target) return null;
+    const ref = target.params.node ?? target.params.nodeId;
+    if (typeof ref !== 'string' || ref.startsWith('$')) return null;
+    return resolveToId(ref);
+  };
+
+  // Everything this batch draws a `supersedes` edge at, as ids AND as the raw
+  // strings written (a target may legitimately be a title).
+  const supersedeTargets = new Set<string>();
+  for (const op of operations) {
+    if (op.tool !== 'graph_connect') continue;
+    if (String(op.params.type ?? '') !== 'supersedes') continue;
+    const to = op.params.to ?? op.params.toId;
+    if (typeof to !== 'string' || to === '') continue;
+    const ref = /^\$(\d+)\.id$/.exec(to);
+    if (ref) {
+      const resolved = staticIdOfOp(Number.parseInt(ref[1], 10));
+      if (resolved) supersedeTargets.add(resolved);
+      continue;
+    }
+    supersedeTargets.add(to);
+    const asId = resolveToId(to);
+    if (asId) supersedeTargets.add(asId);
+  }
+
+  const sanction = [...supersedeTargets];
+  for (const { op } of renames) op.params._supersedesInBatch = sanction;
+
+  for (const { op, i } of renames) {
+    const newName = op.params.newName;
+    const nodeRef = op.params.node;
+    if (typeof newName !== 'string') continue;
+    // A rename whose subject is itself a `$N.id` back-reference cannot be
+    // resolved before execution; the handler's guard catches that case with
+    // the same sanction list, so the capture still cannot land.
+    if (typeof nodeRef !== 'string' || nodeRef.startsWith('$')) continue;
+    const renamedNodeId = resolveToId(nodeRef);
+    // Unresolvable subject: let the handler produce its "no such node" error
+    // rather than inventing a second one here.
+    if (!renamedNodeId) continue;
+
+    const capture = findAddressCapture({
+      newTitle: newName,
+      renamedNodeId,
+      index,
+      supersedesInBatch: supersedeTargets,
+    });
+    if (!capture) continue;
+
+    return {
+      success: false,
+      error: 'IDENTIFIER_IN_USE',
+      operationIndex: i,
+      stableId: capture.stableId,
+      ownedBy: capture.owners,
+      message:
+        `Batch refused at operation ${i} (graph_rename): ` +
+        describeAddressCapture(capture),
+      hint: 'Nothing was executed — the batch was refused before it opened its transaction. Add the `supersedes` edge to this same batch (its position in the list does not matter), or take a free number with graph_next_id.',
+    };
+  }
+
+  return null;
+}
+
 function validateNoOrphans(
   operations: Array<{ tool: string; params: Record<string, unknown> }>,
 ): { valid: boolean; error?: string } {
@@ -690,6 +815,16 @@ async function runBatchTool(
     // Allocation is a safeguard, not a gate: if the index cannot be read, the
     // batch still commits with the titles the agent wrote.
   }
+
+  // RENAME: the identifier space again, from the other side. Allocation above
+  // governs the numbers this batch CREATES; this governs the ones it MOVES.
+  // Runs after allocation (so a title the allocator just rewrote is the title
+  // judged) and before the transaction opens, so a refusal costs nothing.
+  const renameRefusal = guardRenamesAgainstAddressCapture(
+    operations,
+    contextManager,
+  );
+  if (renameRefusal) return renameRefusal;
 
   const results: unknown[] = [];
   const errors: Array<{ index: number; tool: string; error: string }> = [];

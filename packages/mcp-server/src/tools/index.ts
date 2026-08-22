@@ -132,9 +132,10 @@ export async function handleToolCall(
     name === 'graph_archive' ||
     // `graph_rename` rewrites the title, and in this corpus the title carries
     // the stable identifier — so it is an edit of the address space, not
-    // cosmetics. It is routed here as it stands; what it does NOT check is
-    // pinned in second-layer.test.ts under "graph_rename edits the address
-    // space".
+    // cosmetics. It enforces exactly one rule (an identifier a live node wears
+    // can only be taken by the batch that supersedes that node) and reports
+    // everything else; both are pinned in second-layer.test.ts under
+    // "graph_rename edits the address space".
     name === 'graph_rename'
   ) {
     return handleConceptTools(name, args, contextManager);
